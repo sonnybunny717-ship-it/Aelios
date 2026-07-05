@@ -42,7 +42,9 @@ ENABLE_DAILY_SUMMARY_MEMORY = "false"
 ANTHROPIC_THINKING_ENABLED = "true"
 ANTHROPIC_THINKING_BUDGET = "8192"
 ANTHROPIC_CACHE_ENABLED = "true"
-ANTHROPIC_AUTO_CACHE_ENABLED = "true"
+# Explicit layered anchors use the full 4-marker budget; the automatic
+# top-level cache_control would be counted as a 5th marker upstream.
+ANTHROPIC_AUTO_CACHE_ENABLED = "false"
 ANTHROPIC_ROLLING_CACHE_ENABLED = "true"
 ANTHROPIC_CACHE_TTL = "1h"
 # Sticky-routing id so load-balanced relays keep cache hits on one backend.
