@@ -41,9 +41,10 @@ function simpleHash(text) {
 const BLOCK_ORDER = [
   "proxy_static_rules",
   "persona_pinned",
-  "long_term_summary",
   "preset_lite",
   "client_system",
+  "daily_context",
+  "long_term_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
   "vision_context",
@@ -197,6 +198,9 @@ function assemble(ctx) {
         const truncated = c.length <= SUMMARY_MAX_CHARS ? c : c.slice(0, SUMMARY_MAX_CHARS - 3) + "...";
         text = `长期对话摘要：\n${truncated}`;
       }
+    } else if (blockId === "daily_context") {
+      const daily = ctx.dailyContext && ctx.dailyContext.trim();
+      if (daily) text = daily;
     } else if (blockId === "preset_lite") {
       text = PRESET_LITE_TEXT;
     } else if (blockId === "client_system") {
@@ -236,9 +240,9 @@ function assemble(ctx) {
     if (text === null) continue;
 
     const systemBlock = { role: "system", text };
-    if (blockId === "client_system") {
+    if (blockId === "client_system" || blockId === "daily_context" || blockId === "long_term_summary") {
       systemBlock.cache_control = { type: "ephemeral", ttl: "5m" };
-      anchorIndex = systemBlocks.length;
+      if (blockId === "client_system") anchorIndex = systemBlocks.length;
     }
 
     systemBlocks.push(systemBlock);
@@ -295,6 +299,7 @@ function makeBaseCtx() {
       { id: "a-1", type: "identity", content: "名字是咲咲", importance: 0.95 },
     ],
     summaryEntry: { content: "这是一段很长的对话摘要，用于测试截断和稳定性。" },
+    dailyContext: null,
     ragMemories: [
       { type: "note", importance: 0.6, content: "用户喜欢猫" },
     ],
@@ -453,17 +458,27 @@ check("client_system block has cache_control", () => {
   assert.deepStrictEqual(block.cache_control, { type: "ephemeral", ttl: "5m" });
 });
 
-check("no other block has cache_control", () => {
+check("only anchor blocks have cache_control", () => {
   const ctx = makeBaseCtx();
+  ctx.dailyContext = "今天的日期：测试日";
   const result = assemble(ctx);
 
+  const anchorIds = new Set(["client_system", "daily_context", "long_term_summary"]);
   for (let i = 0; i < result.system_blocks.length; i++) {
-    if (i === result.meta.anchor_index) continue;
-    assert.strictEqual(
-      result.system_blocks[i].cache_control,
-      undefined,
-      `block at index ${i} (${result.meta.block_ids[i]}) should not have cache_control`
-    );
+    const id = result.meta.block_ids[i];
+    if (anchorIds.has(id)) {
+      assert.deepStrictEqual(
+        result.system_blocks[i].cache_control,
+        { type: "ephemeral", ttl: "5m" },
+        `anchor block ${id} should have cache_control`
+      );
+    } else {
+      assert.strictEqual(
+        result.system_blocks[i].cache_control,
+        undefined,
+        `block at index ${i} (${id}) should not have cache_control`
+      );
+    }
   }
 });
 
@@ -472,7 +487,7 @@ check("stable blocks come before client_system, dynamic after", () => {
   const result = assemble(ctx);
 
   const csPos = result.meta.block_ids.indexOf("client_system");
-  const stableBefore = ["proxy_static_rules", "persona_pinned", "long_term_summary", "preset_lite"];
+  const stableBefore = ["proxy_static_rules", "persona_pinned", "preset_lite"];
   const dynamicAfter = ["dynamic_memory_patch", "vision_context"];
 
   for (const id of stableBefore) {
@@ -744,8 +759,9 @@ check("non-anchor blocks have no cache_control", () => {
   const assembled = assemble(ctx);
   const anthropicSystem = assembledToAnthropicSystem(assembled.system_blocks);
 
+  const anchorIds = new Set(["client_system", "daily_context", "long_term_summary"]);
   for (let i = 0; i < anthropicSystem.length; i++) {
-    if (i === assembled.meta.anchor_index) continue;
+    if (anchorIds.has(assembled.meta.block_ids[i])) continue;
     assert.strictEqual(
       anthropicSystem[i].cache_control,
       undefined,
@@ -994,16 +1010,17 @@ check("assembler output for image request preserves image_url", () => {
 // ---------------------------------------------------------------------------
 
 function applyCacheOverrides(systemBlocks, env) {
-  const anchor = systemBlocks.find((b) => b.cache_control);
-  if (!anchor) return;
+  for (const block of systemBlocks) {
+    if (!block.cache_control) continue;
 
-  if (env.ANTHROPIC_CACHE_ENABLED === "false") {
-    delete anchor.cache_control;
-    return;
+    if (env.ANTHROPIC_CACHE_ENABLED === "false") {
+      delete block.cache_control;
+      continue;
+    }
+
+    const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+    block.cache_control = { type: "ephemeral", ttl };
   }
-
-  const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
-  anchor.cache_control = { type: "ephemeral", ttl };
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,16 +1029,16 @@ function applyCacheOverrides(systemBlocks, env) {
 
 console.log("\n--- Test 9: Anthropic path ---");
 
-check("cache_control on client_system block only", () => {
+check("cache_control on anchor layers only (client_system + summary in base ctx)", () => {
   const ctx = makeBaseCtx();
   const assembled = assemble(ctx);
   const anthropicSystem = assembledToAnthropicSystem(assembled.system_blocks);
 
-  // Exactly one block should have cache_control
+  // Base ctx has a summaryEntry and no dailyContext → exactly two anchors
   const withCache = anthropicSystem.filter((b) => b.cache_control);
-  assert.strictEqual(withCache.length, 1);
+  assert.strictEqual(withCache.length, 2);
 
-  // That block should be the one at anchor_index
+  // The primary anchor sits at anchor_index (client_system)
   const anchorBlock = anthropicSystem[assembled.meta.anchor_index];
   assert.ok(anchorBlock.cache_control);
   assert.strictEqual(anchorBlock.cache_control.type, "ephemeral");
@@ -1578,7 +1595,7 @@ check("OpenAI helper: strips Claude native thinking but keeps reasoning_effort",
   assert.strictEqual(req.reasoning_effort, "high");
 });
 
-check("Anthropic helper: system cache_control stays on client_system", () => {
+check("Anthropic helper: system cache_control stays on anchor layers", () => {
   const ctx = makeBaseCtx();
   ctx.systemMessages = [{ role: "system", content: "角色卡" }];
   ctx.ragMemories = [{ type: "note", importance: 0.7, content: "喜欢猫" }];
@@ -1589,9 +1606,10 @@ check("Anthropic helper: system cache_control stays on client_system", () => {
     assembled,
     {}
   );
+  // Base ctx carries a summaryEntry → client_system + long_term_summary anchors
   const withCache = req.system.filter((b) => b.cache_control);
-  assert.strictEqual(withCache.length, 1);
-  assert.ok(withCache[0].text.includes("角色卡"));
+  assert.strictEqual(withCache.length, 2);
+  assert.ok(withCache.some((b) => b.text.includes("角色卡")));
 });
 
 check("Anthropic helper: rolling cache_control lands on latest user message", () => {
@@ -3229,15 +3247,37 @@ check("assembler: summaryEntry with empty content skips block", () => {
   assert.ok(!assembled.meta.block_ids.includes("long_term_summary"));
 });
 
-check("assembler: summary block position is after persona_pinned, before preset_lite", () => {
+check("assembler: summary block position is after client_system (own cache layer)", () => {
   const ctx = makeBaseCtx();
   ctx.summaryEntry = { content: "测试摘要" };
   const assembled = assemble(ctx);
   const summaryIdx = assembled.meta.block_ids.indexOf("long_term_summary");
-  const presetIdx = assembled.meta.block_ids.indexOf("preset_lite");
+  const csIdx = assembled.meta.block_ids.indexOf("client_system");
   assert.ok(summaryIdx >= 0);
-  assert.ok(presetIdx >= 0);
-  assert.ok(summaryIdx < presetIdx, "long_term_summary should come before preset_lite");
+  assert.ok(csIdx >= 0);
+  assert.ok(summaryIdx > csIdx, "long_term_summary should come after client_system");
+  assert.deepStrictEqual(assembled.system_blocks[summaryIdx].cache_control, { type: "ephemeral", ttl: "5m" });
+});
+
+check("assembler: daily_context sits between client_system and long_term_summary", () => {
+  const ctx = makeBaseCtx();
+  ctx.dailyContext = "今天的日期：2026年7月5日星期日";
+  ctx.summaryEntry = { content: "测试摘要" };
+  const assembled = assemble(ctx);
+  const csIdx = assembled.meta.block_ids.indexOf("client_system");
+  const dailyIdx = assembled.meta.block_ids.indexOf("daily_context");
+  const summaryIdx = assembled.meta.block_ids.indexOf("long_term_summary");
+  assert.ok(dailyIdx > csIdx, "daily_context should come after client_system");
+  assert.ok(summaryIdx > dailyIdx, "long_term_summary should come after daily_context");
+  assert.deepStrictEqual(assembled.system_blocks[dailyIdx].cache_control, { type: "ephemeral", ttl: "5m" });
+  assert.strictEqual(assembled.meta.anchor_index, csIdx, "anchor_index should still point at client_system");
+});
+
+check("assembler: empty dailyContext skips the daily_context block", () => {
+  const ctx = makeBaseCtx();
+  ctx.dailyContext = "   ";
+  const assembled = assemble(ctx);
+  assert.strictEqual(assembled.meta.block_ids.indexOf("daily_context"), -1);
 });
 
 // ---------------------------------------------------------------------------

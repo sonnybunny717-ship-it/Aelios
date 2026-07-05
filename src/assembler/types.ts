@@ -46,6 +46,9 @@ export interface AssemblerContext {
   /** Latest summary entry from the summaries table, or null. */
   summaryEntry: SummaryEntry | null;
 
+  /** Once-per-day context (date line etc.); stable within a calendar day. */
+  dailyContext: string | null;
+
   /** RAG hits for the current round. */
   ragMemories: MemoryApiRecord[];
 
@@ -86,9 +89,10 @@ export interface AssembledPrompt {
 export const BLOCK_ORDER: readonly string[] = [
   "proxy_static_rules",
   "persona_pinned",
-  "long_term_summary",
   "preset_lite",
   "client_system",
+  "daily_context",
+  "long_term_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
   "vision_context",
@@ -97,8 +101,12 @@ export const BLOCK_ORDER: readonly string[] = [
 ] as const;
 
 /**
- * The cache anchor always falls after client_system (index 4).
- * Stable blocks before it stay cached; dynamic/passthrough blocks after do not.
+ * Layered cache anchors, ordered least→most volatile so an update to one
+ * layer never invalidates the layers above it:
+ *   client_system     — anchor 1: rules + persona + preset + frontend system
+ *   daily_context     — anchor 2: changes once per day
+ *   long_term_summary — anchor 3: regenerated every N messages
+ * meta.anchor_index still points at client_system (the primary anchor).
  */
 export const CACHE_ANCHOR_AFTER_ID = "client_system";
 

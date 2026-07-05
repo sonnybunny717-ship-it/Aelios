@@ -443,16 +443,19 @@ export function buildAnthropicRequestFromAssembled(
 }
 
 function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void {
-  const anchor = systemBlocks.find((b) => b.cache_control);
-  if (!anchor) return;
+  // Layered anchors: client_system, daily_context, and long_term_summary can
+  // each carry cache_control — override TTL (or strip) on every one of them.
+  for (const block of systemBlocks) {
+    if (!block.cache_control) continue;
 
-  if (env.ANTHROPIC_CACHE_ENABLED === "false") {
-    delete anchor.cache_control;
-    return;
+    if (env.ANTHROPIC_CACHE_ENABLED === "false") {
+      delete block.cache_control;
+      continue;
+    }
+
+    const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+    block.cache_control = { type: "ephemeral", ttl };
   }
-
-  const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
-  anchor.cache_control = { type: "ephemeral", ttl };
 }
 
 export async function callAnthropicNative(env: Env, body: AnthropicRequest, targetModel?: string): Promise<Response> {

@@ -43,6 +43,23 @@ export function hasToolContent(body: OpenAIChatRequest): boolean {
 }
 
 /**
+ * Once-per-day context for the assembler's daily_context cache layer.
+ * Must be stable within a calendar day (same day → same string), so the
+ * cached prefix only rewrites at local midnight.
+ */
+function buildDailyContext(env: Env): string {
+  const timeZone = env.DREAM_TIME_ZONE || "Asia/Shanghai";
+  const date = new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "long"
+  }).format(new Date());
+  return `今天的日期：${date}`;
+}
+
+/**
  * Fetch pinned memories whose type is "persona" or "identity" from D1.
  * Returns MemoryApiRecord[] for the assembler's persona_pinned block.
  * Deterministic sort is applied later by the assembler itself.
@@ -123,6 +140,7 @@ export async function handleChatCompletions(
   const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env.DB, auth.profile.namespace);
   const latestSummary = await getLatestSummary(env.DB, auth.profile.namespace);
   const summaryEntry = latestSummary ? { content: latestSummary.content } : null;
+  const dailyContext = buildDailyContext(env);
 
   let upstream: Response;
   let clientSystemHash: string | null = null;
@@ -143,6 +161,7 @@ export async function handleChatCompletions(
           request: body,
           pinnedPersonaMemories,
           summaryEntry,
+          dailyContext,
           ragMemories: memories,
           visionOutput: null,
         });
@@ -164,6 +183,7 @@ export async function handleChatCompletions(
           request: body,
           pinnedPersonaMemories,
           summaryEntry,
+          dailyContext,
           ragMemories: memories,
           visionOutput: null,
         });
