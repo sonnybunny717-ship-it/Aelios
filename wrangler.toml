@@ -39,12 +39,14 @@ DREAM_MEMORY_CONTEXT_LIMIT = "40"
 DREAM_MAX_RUNS = "10"
 DREAM_MAX_TOKENS = "8000"
 ENABLE_DAILY_SUMMARY_MEMORY = "false"
-ANTHROPIC_THINKING_ENABLED = "false"
-ANTHROPIC_THINKING_BUDGET = "1024"
+ANTHROPIC_THINKING_ENABLED = "true"
+ANTHROPIC_THINKING_BUDGET = "8192"
 ANTHROPIC_CACHE_ENABLED = "true"
 ANTHROPIC_AUTO_CACHE_ENABLED = "true"
 ANTHROPIC_ROLLING_CACHE_ENABLED = "true"
-ANTHROPIC_CACHE_TTL = "5m"
+ANTHROPIC_CACHE_TTL = "1h"
+# Sticky-routing id so load-balanced relays keep cache hits on one backend.
+ANTHROPIC_CACHE_USER_ID = "aelios-sticky-stable"
 # For custom Anthropic-compatible providers whose base_url already ends in /v1,
 # keep this as "messages". If the base_url is only the root domain, use
 # "v1/messages".
@@ -54,6 +56,11 @@ CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
 # AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
 # GUIDE_DOG_API_KEY, CF_AIG_TOKEN.
 # D1 binding is auto-filled by `npm run setup:cloudflare`.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "companion_memory_proxy"
+database_id = "f4adb619-7591-4994-9a47-4942705c8036"
 
 [[vectorize]]
 binding = "VECTORIZE"

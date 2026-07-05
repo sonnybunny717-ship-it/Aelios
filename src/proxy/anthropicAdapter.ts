@@ -22,6 +22,9 @@ interface AnthropicMessage {
 interface AnthropicRequest {
   model: string;
   max_tokens: number;
+  metadata?: {
+    user_id: string;
+  };
   cache_control?: {
     type: "ephemeral";
     ttl?: "5m" | "1h";
@@ -85,10 +88,9 @@ function buildAutomaticCacheControl(env: Env): AnthropicRequest["cache_control"]
   return buildCacheControl(env);
 }
 
-function getRollingCacheWindowSize(env: Env): number {
-  const value = Number(env.ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE || 20);
-  if (!Number.isFinite(value)) return 20;
-  return Math.max(Math.floor(value), 1);
+function buildCacheMetadata(env: Env): AnthropicRequest["metadata"] | undefined {
+  if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
+  return { user_id: env.ANTHROPIC_CACHE_USER_ID || "aelios-sticky-stable" };
 }
 
 export function getAnthropicCacheMode(env: Env): string | null {
@@ -105,12 +107,11 @@ function applyRollingMessageCache(messages: AnthropicMessage[], env: Env): void 
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
-  const isFullWindow = messages.length >= getRollingCacheWindowSize(env);
-  const start = isFullWindow ? 0 : messages.length - 1;
-  const end = isFullWindow ? messages.length : -1;
-  const step = isFullWindow ? 1 : -1;
-
-  for (let i = start; i !== end; i += step) {
+  // Rolling breakpoint on the last user message: each turn the boundary
+  // advances and only the delta since the previous hit is written (1.25x on
+  // the increment, 0.1x reads on everything before it). Volatile context is
+  // appended AFTER this marked block, so it never enters the cached prefix.
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     if (message.role !== "user" || message.content.length === 0) continue;
     message.content[message.content.length - 1].cache_control = cacheControl;
@@ -132,20 +133,33 @@ function appendUncachedUserContext(messages: AnthropicMessage[], text: string | 
   messages.push({ role: "user", content: [{ type: "text", text: trimmed }] });
 }
 
-function splitDynamicMemorySystemBlock(
+function splitDynamicSystemBlocks(
   assembled: AssembledPrompt
-): { systemBlocks: AssembledPrompt["system_blocks"]; dynamicMemoryPatch: string | null } {
-  const idx = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
-  if (idx < 0 || idx >= assembled.system_blocks.length) {
-    return { systemBlocks: assembled.system_blocks, dynamicMemoryPatch: null };
+): { systemBlocks: AssembledPrompt["system_blocks"]; dynamicMemoryPatch: string | null; volatileContext: string | null } {
+  const memIdx = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
+  const volIdx = assembled.meta.block_ids.indexOf("client_volatile_context");
+
+  const removeSet = new Set<number>();
+  let dynamicMemoryPatch: string | null = null;
+  let volatileContext: string | null = null;
+
+  if (memIdx >= 0 && memIdx < assembled.system_blocks.length) {
+    dynamicMemoryPatch = assembled.system_blocks[memIdx].text;
+    removeSet.add(memIdx);
+  }
+  if (volIdx >= 0 && volIdx < assembled.system_blocks.length) {
+    volatileContext = assembled.system_blocks[volIdx].text;
+    removeSet.add(volIdx);
+  }
+
+  if (removeSet.size === 0) {
+    return { systemBlocks: assembled.system_blocks, dynamicMemoryPatch: null, volatileContext: null };
   }
 
   return {
-    systemBlocks: [
-      ...assembled.system_blocks.slice(0, idx),
-      ...assembled.system_blocks.slice(idx + 1),
-    ],
-    dynamicMemoryPatch: assembled.system_blocks[idx].text,
+    systemBlocks: assembled.system_blocks.filter((_, i) => !removeSet.has(i)),
+    dynamicMemoryPatch,
+    volatileContext,
   };
 }
 
@@ -378,6 +392,7 @@ export async function buildAnthropicNativeRequest(
   return {
     model: stripAnthropicModelPrefix(input.targetModel),
     max_tokens: getAnthropicMaxTokens(req, input.env, thinking),
+    metadata: buildCacheMetadata(input.env),
     cache_control: buildAutomaticCacheControl(input.env),
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
@@ -406,16 +421,18 @@ export function buildAnthropicRequestFromAssembled(
   env: Env
 ): AnthropicRequest {
   const thinking = buildThinkingConfig(env, req);
-  const { systemBlocks, dynamicMemoryPatch } = splitDynamicMemorySystemBlock(assembled);
+  const { systemBlocks, dynamicMemoryPatch, volatileContext } = splitDynamicSystemBlocks(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
   applyCacheOverrides(system, env);
   applyRollingMessageCache(messages, env);
+  appendUncachedUserContext(messages, volatileContext);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
 
   return {
     model: stripAnthropicModelPrefix(targetModel),
     max_tokens: getAnthropicMaxTokens(req, env, thinking),
+    metadata: buildCacheMetadata(env),
     cache_control: buildAutomaticCacheControl(env),
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
