@@ -1,7 +1,7 @@
 import { saveAssistantMessage } from "../db/messages";
 import { saveUsageLog } from "../db/usageLogs";
 import { enqueueMemoryMaintenanceIfNeeded, enqueueRetentionIfNeeded } from "../queue/producer";
-import { getAnthropicCacheMode, normalizeAnthropicUsage } from "./anthropicAdapter";
+import { getAnthropicCacheMode, getAnthropicCacheTtl, normalizeAnthropicUsage } from "./anthropicAdapter";
 import {
   createThinkingFilterState,
   flushStreamFilter,
@@ -22,6 +22,7 @@ interface StreamAnthropicOptions {
   provider: string;
   clientSystemHash?: string | null;
   cacheAnchorBlock?: string | null;
+  cacheDiagnosticsJson?: string | null;
 }
 
 interface StreamState {
@@ -114,7 +115,7 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
     finishReason: state.finishReason,
     usage: state.usage,
     cacheMode: getAnthropicCacheMode(options.env),
-    cacheTtl: options.env.ANTHROPIC_CACHE_TTL || "5m"
+    cacheTtl: getAnthropicCacheTtl(options.env, options.upstreamModel)
   });
 
   await saveUsageLog(options.env.DB, {
@@ -124,9 +125,10 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
     model: options.upstreamModel,
     usage: state.usage,
     cacheMode: getAnthropicCacheMode(options.env),
-    cacheTtl: options.env.ANTHROPIC_CACHE_TTL || "5m",
+    cacheTtl: getAnthropicCacheTtl(options.env, options.upstreamModel),
     clientSystemHash: options.clientSystemHash ?? null,
-    cacheAnchorBlock: options.cacheAnchorBlock ?? null
+    cacheAnchorBlock: options.cacheAnchorBlock ?? null,
+    cacheDiagnosticsJson: options.cacheDiagnosticsJson ?? null
   });
 
   await enqueueMemoryMaintenanceIfNeeded(options.env, {

@@ -4,7 +4,7 @@ export const KEY_PROFILES = {
   chatbox: {
     source: "chatbox",
     namespace: "default",
-    scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write"],
+    scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write", "billing:read"],
     injectionMode: "rag",
     memoryMode: "external",
     allowModelPassthrough: false,
@@ -22,7 +22,7 @@ export const KEY_PROFILES = {
   debug: {
     source: "debug",
     namespace: "default",
-    scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write", "debug:read"],
+    scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write", "billing:read", "debug:read"],
     injectionMode: "full",
     memoryMode: "hybrid",
     allowModelPassthrough: true,

@@ -6,6 +6,8 @@ export interface Env {
   VECTORIZE_INDEX_NAME?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_API_TOKEN?: string;
+  AI_GATEWAY_ID?: string;
+  OPENROUTER_MANAGEMENT_KEY?: string;
   PUBLIC_MODEL_NAME?: string;
   CHAT_MODEL?: string;
   DEFAULT_UPSTREAM_MODEL?: string;
@@ -26,6 +28,7 @@ export interface Env {
   DREAM_MAX_RUNS?: string;
   DREAM_MAX_TOKENS?: string;
   DREAM_MODEL?: string;
+  WINDOW_SUMMARY_MODEL?: string;
   DREAM_MEMORY_CONTEXT_LIMIT?: string;
   DREAM_EXCERPT_LIMIT?: string;
   DREAM_TIME_ZONE?: string;
@@ -97,6 +100,7 @@ export type Scope =
   | "memory:write"
   | "cache:read"
   | "cache:write"
+  | "billing:read"
   | "debug:read"
   | "export:read";
 
@@ -168,6 +172,11 @@ export interface TokenUsage {
 export interface Conversation {
   id: string;
   namespace: string;
+  summary_snapshot: string | null;
+  summary_snapshot_source_updated_at: string | null;
+  context_epoch: number;
+  window_summary: string | null;
+  persona_snapshot_json: string | null;
   created_at: string;
   updated_at: string;
 }

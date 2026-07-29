@@ -55,8 +55,9 @@ ANTHROPIC_CACHE_USER_ID = "aelios-sticky-stable"
 CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
 
 # Private/account-specific variables live in the Cloudflare Dashboard:
-# AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
-# GUIDE_DOG_API_KEY, CF_AIG_TOKEN.
+# AI_GATEWAY_BASE_URL, AI_GATEWAY_ID, CLOUDFLARE_ACCOUNT_ID,
+# CLOUDFLARE_API_TOKEN, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
+# GUIDE_DOG_API_KEY, CF_AIG_TOKEN, OPENROUTER_MANAGEMENT_KEY.
 # D1 binding is auto-filled by `npm run setup:cloudflare`.
 
 [[d1_databases]]

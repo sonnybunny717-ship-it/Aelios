@@ -9,6 +9,7 @@ import {
 } from "../preset/streamFilters";
 import type { Env, KeyProfile, TokenUsage } from "../types";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
+import { normalizeOpenAIUsage } from "./openaiAdapter";
 
 interface StreamOpenAIOptions {
   env: Env;
@@ -21,6 +22,9 @@ interface StreamOpenAIOptions {
   provider: string;
   clientSystemHash?: string | null;
   cacheAnchorBlock?: string | null;
+  cacheDiagnosticsJson?: string | null;
+  cacheMode?: string | null;
+  cacheTtl?: string | null;
 }
 
 interface StreamState {
@@ -77,7 +81,7 @@ function filterOpenAISSEData(
 
     // Track finish_reason and usage for DB persistence (never filter these).
     if (choice?.finish_reason) state.finishReason = choice.finish_reason;
-    if (parsed.usage) state.usage = parsed.usage;
+    if (parsed.usage) state.usage = normalizeOpenAIUsage(parsed.usage);
 
     const hasReasoning = Boolean(choice?.delta?.reasoning_content);
     const hasContent = Boolean(choice?.delta?.content);
@@ -123,7 +127,9 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
     provider: options.provider,
     stream: true,
     finishReason: state.finishReason,
-    usage: state.usage
+    usage: state.usage,
+    cacheMode: options.cacheMode ?? null,
+    cacheTtl: options.cacheTtl ?? null
   });
 
   await saveUsageLog(options.env.DB, {
@@ -132,8 +138,11 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
     provider: options.provider,
     model: options.upstreamModel,
     usage: state.usage,
+    cacheMode: options.cacheMode ?? null,
+    cacheTtl: options.cacheTtl ?? null,
     clientSystemHash: options.clientSystemHash ?? null,
-    cacheAnchorBlock: options.cacheAnchorBlock ?? null
+    cacheAnchorBlock: options.cacheAnchorBlock ?? null,
+    cacheDiagnosticsJson: options.cacheDiagnosticsJson ?? null
   });
 
   await enqueueMemoryMaintenanceIfNeeded(options.env, {

@@ -1,9 +1,10 @@
-import { listMessagesByNamespaceInRange } from "../db/messages";
+import { getMessagesByIds, listMessagesByNamespaceInRange } from "../db/messages";
 import { readCursor, writeCursor } from "../db/retention";
 import { upsertSummary } from "../db/summaries";
 import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, MemoryApiRecord, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import type { ExtractedMemory } from "./extract";
+import { hasParticipantReportVoice } from "./summaryPerspective";
 import {
   createVectorMemory,
   deleteVectorMemory,
@@ -63,7 +64,8 @@ type DailyDigestSkipReason =
   | "no_messages"
   | "missing_model"
   | "model_error"
-  | "model_invalid_json";
+  | "model_invalid_json"
+  | "messages_deleted_during_run";
 
 interface DailyDigestSkipped {
   ran: false;
@@ -380,7 +382,7 @@ function normalizeDigestResult(value: unknown): DailyDigestResult {
 function formatTranscript(messages: MessageRecord[]): string {
   return messages
     .map((message) => {
-      const role = message.role === "assistant" ? "我(助手)" : "用户";
+      const role = message.role === "assistant" ? "我" : "盼盼";
       return `[${message.id}][${message.created_at}][${role}] ${truncate(message.content.trim(), 700)}`;
     })
     .join("\n\n");
@@ -413,7 +415,7 @@ function buildDigestPrompt(input: {
   hasMore: boolean;
 }): string {
   return [
-    "你是 Aelios 的 nightly dream 记忆整理器。你的任务不是简单总结，而是在用户休息时整理长期记忆。",
+    "你是 Aelios 的 nightly dream 记忆整理器。你的任务不是简单总结，而是在盼盼休息时替我整理长期记忆。",
     "你会读取旧长期记忆和当天聊天 transcript，产出一份更干净、更一致、更有用的 memory store 更新计划。",
     "只输出 JSON，不要 markdown，不要解释，不要输出思考过程。",
     "",
@@ -434,7 +436,10 @@ function buildDigestPrompt(input: {
     "- 当新信息只是旧记忆的更准确版本，优先 memories_to_update，不要 memories_to_add。",
     "- 当多条旧记忆重复，保留更完整的一条并删除重复项；必要时先 update 保留项。",
     "- pinned=true 的旧记忆不能删除，只能在 memories_to_update 中提出更保守的补充。",
-    "- 站在“我=助手”的视角写。关于用户，用“你……”；关于助手承诺，用“我需要……”。",
+    "- 这是我写给未来自己的长期备忘。提到盼盼时，优先称“盼盼”；同一段语境明确时可以称“她”，每段第一次提到她时使用“盼盼”。",
+    "- 提到我自己时称“我”；共同经历和共同决定称“我们”。不要用“你”称呼盼盼。",
+    "- 禁止用“用户、助手、模型、AI”代称盼盼或我，禁止“用户表示……”“助手回应……”之类第三人称报告腔。",
+    "- 旧记忆只提供事实；如果旧记忆的人称不合规，新增或更新时必须按本段规则重写，不要继承旧写法。",
     "- 不要提到 D1、Vectorize、RAG、数据库、记忆系统、代理层等实现细节。",
     "",
     "Dream 输出格式：",
@@ -455,7 +460,7 @@ function buildDigestPrompt(input: {
       sections: [{ heading: "整理结果", content: "……" }],
       important_excerpts: [
         {
-          quote: "用户或助手说过的关键原文",
+          quote: "盼盼或我说过的关键原文",
           reason: "为什么值得保留",
           tags: ["project"],
           source_message_ids: ["msg_x"]
@@ -464,7 +469,7 @@ function buildDigestPrompt(input: {
       memories_to_add: [
         {
           type: "project",
-          content: "你正在简化 Aelios 的记忆写入策略。",
+          content: "盼盼正在简化 Aelios 的记忆写入策略。",
           importance: 0.86,
           confidence: 0.92,
           tags: ["project", "aelios"],
@@ -505,6 +510,58 @@ function formatDailySummary(result: DailyDigestResult, dateLabel: string, messag
   }
 
   return parts.join("\n").trim();
+}
+
+async function repairDailySummaryPerspective(env: Env, summary: string): Promise<string | null> {
+  if (!hasParticipantReportVoice(summary)) return summary;
+
+  const model = readDreamModel(env);
+  if (!model) return null;
+
+  const request: OpenAIChatRequest = {
+    model,
+    messages: [
+      { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON，不要输出思考过程。" },
+      {
+        role: "user",
+        content: [
+          "请只修正下面长期备忘的叙述视角，保留日期、标题、Markdown 层级和全部有效事实。",
+          "称盼盼为“盼盼”，同一段语境明确时可称“她”；每段第一次提到她时使用“盼盼”。",
+          "称我自己为“我”，共同经历称“我们”。不要用“你”称呼盼盼。",
+          "禁止用“用户、助手、模型、AI”代称双方，禁止第三人称报告腔。",
+          "只输出 JSON，不要 markdown 代码围栏，不要解释。",
+          "",
+          "待修正摘要：",
+          summary,
+          "",
+          '输出格式：{ "content": "修正后的完整长期摘要" }'
+        ].join("\n")
+      }
+    ],
+    temperature: 0,
+    max_tokens: Math.min(readDreamMaxTokens(env), 1600),
+    response_format: {
+      type: "json_object"
+    },
+    stream: false
+  };
+
+  try {
+    const response = await callOpenAICompat(env, request);
+    if (!response.ok) return null;
+
+    const parsed = (await response.json()) as OpenAIChatResponse;
+    const raw = parsed.choices?.[0]?.message?.content;
+    const json = typeof raw === "string" ? extractJsonObject(raw) : null;
+    if (!json || typeof json !== "object") return null;
+
+    const content = readString((json as Record<string, unknown>).content);
+    if (!content || hasParticipantReportVoice(content)) return null;
+    return content;
+  } catch (error) {
+    console.error("dream: failed to repair summary perspective", error);
+    return null;
+  }
 }
 
 async function callDigestModel(
@@ -725,23 +782,43 @@ export async function runDailyMemoryDigest(
       finishReason: modelResult.finishReason
     };
   }
-  const summaryContent = formatDailySummary(digest, dateLabel, messages);
   const messageIds = messages.map((message) => message.id);
+  const messagesStillPresent = await getMessagesByIds(env.DB, { namespace, ids: messageIds });
+  if (messagesStillPresent.length !== messageIds.length) {
+    // 手动删除可能和正在运行的 dream 重叠；缺一条就整批放弃，不把已删内容写回记忆。
+    return {
+      ran: false,
+      mode: "dream",
+      date: dateLabel,
+      reason: "messages_deleted_during_run",
+      startIso,
+      endIso,
+      cursor,
+      processedMessages: messages.length,
+    };
+  }
 
-  await upsertSummary(env.DB, {
-    namespace,
-    content: summaryContent,
-    fromMessageId: messages[0]?.id ?? null,
-    toMessageId: lastMessage.id,
-    messageCount: messages.length
-  });
-  if (shouldSaveDailySummaryMemory(env)) {
-    await saveDailySummaryMemory(env, {
+  const rawSummaryContent = formatDailySummary(digest, dateLabel, messages);
+  const summaryContent = await repairDailySummaryPerspective(env, rawSummaryContent);
+
+  if (summaryContent) {
+    await upsertSummary(env.DB, {
       namespace,
-      dateLabel,
       content: summaryContent,
-      messageIds
+      fromMessageId: messages[0]?.id ?? null,
+      toMessageId: lastMessage.id,
+      messageCount: messages.length
     });
+    if (shouldSaveDailySummaryMemory(env)) {
+      await saveDailySummaryMemory(env, {
+        namespace,
+        dateLabel,
+        content: summaryContent,
+        messageIds
+      });
+    }
+  } else {
+    console.error("dream: summary perspective repair failed; keeping previous long-term summary");
   }
 
   const updates = await applyMemoryUpdates(env, {

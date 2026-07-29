@@ -7,6 +7,8 @@ import { handleGuideDogChatCompletions } from "./api/guideDog";
 import { handleIngestMessagesApi, handleMemories, handleSearchMemoriesApi } from "./api/memories";
 import { handleMcp } from "./api/mcp";
 import { handleModels } from "./api/models";
+import { handleBillingBalances } from "./api/billing";
+import { handleDeleteConversation } from "./api/conversations";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
 import { runMemoryRetention } from "./memory/retention";
 import { handleQueueMessage } from "./queue/consumer";
@@ -50,6 +52,14 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       return handleModels(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/billing/balances") {
+      return handleBillingBalances(request, env);
+    }
+
+    if (request.method === "DELETE" && url.pathname.startsWith("/v1/conversations/")) {
+      return handleDeleteConversation(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {

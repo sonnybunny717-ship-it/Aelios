@@ -35,9 +35,6 @@ export interface AssembleInput {
   /** Latest summary entry from the summaries table, or null. */
   summaryEntry: SummaryEntry | null;
 
-  /** Once-per-day context (date line etc.); stable within a calendar day. */
-  dailyContext: string | null;
-
   /** RAG hits for the current round. */
   ragMemories: MemoryApiRecord[];
 
@@ -66,7 +63,6 @@ export function assemble(input: AssembleInput): AssembledPrompt {
     systemMessages: extractSystemMessages(request.messages),
     pinnedPersonaMemories: input.pinnedPersonaMemories,
     summaryEntry: input.summaryEntry,
-    dailyContext: input.dailyContext,
     ragMemories: input.ragMemories,
     visionOutput: input.visionOutput,
     historyMessages: extractHistoryMessages(request.messages),

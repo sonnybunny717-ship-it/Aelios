@@ -43,7 +43,6 @@ const BLOCK_ORDER = [
   "persona_pinned",
   "preset_lite",
   "client_system",
-  "daily_context",
   "long_term_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
@@ -198,9 +197,6 @@ function assemble(ctx) {
         const truncated = c.length <= SUMMARY_MAX_CHARS ? c : c.slice(0, SUMMARY_MAX_CHARS - 3) + "...";
         text = `长期对话摘要：\n${truncated}`;
       }
-    } else if (blockId === "daily_context") {
-      const daily = ctx.dailyContext && ctx.dailyContext.trim();
-      if (daily) text = daily;
     } else if (blockId === "preset_lite") {
       text = PRESET_LITE_TEXT;
     } else if (blockId === "client_system") {
@@ -240,7 +236,7 @@ function assemble(ctx) {
     if (text === null) continue;
 
     const systemBlock = { role: "system", text };
-    if (blockId === "client_system" || blockId === "daily_context" || blockId === "long_term_summary") {
+    if (blockId === "client_system" || blockId === "long_term_summary") {
       systemBlock.cache_control = { type: "ephemeral", ttl: "5m" };
       if (blockId === "client_system") anchorIndex = systemBlocks.length;
     }
@@ -299,7 +295,6 @@ function makeBaseCtx() {
       { id: "a-1", type: "identity", content: "名字是咲咲", importance: 0.95 },
     ],
     summaryEntry: { content: "这是一段很长的对话摘要，用于测试截断和稳定性。" },
-    dailyContext: null,
     ragMemories: [
       { type: "note", importance: 0.6, content: "用户喜欢猫" },
     ],
@@ -460,10 +455,9 @@ check("client_system block has cache_control", () => {
 
 check("only anchor blocks have cache_control", () => {
   const ctx = makeBaseCtx();
-  ctx.dailyContext = "今天的日期：测试日";
   const result = assemble(ctx);
 
-  const anchorIds = new Set(["client_system", "daily_context", "long_term_summary"]);
+  const anchorIds = new Set(["client_system", "long_term_summary"]);
   for (let i = 0; i < result.system_blocks.length; i++) {
     const id = result.meta.block_ids[i];
     if (anchorIds.has(id)) {
@@ -759,7 +753,7 @@ check("non-anchor blocks have no cache_control", () => {
   const assembled = assemble(ctx);
   const anthropicSystem = assembledToAnthropicSystem(assembled.system_blocks);
 
-  const anchorIds = new Set(["client_system", "daily_context", "long_term_summary"]);
+  const anchorIds = new Set(["client_system", "long_term_summary"]);
   for (let i = 0; i < anthropicSystem.length; i++) {
     if (anchorIds.has(assembled.meta.block_ids[i])) continue;
     assert.strictEqual(
@@ -1009,7 +1003,7 @@ check("assembler output for image request preserves image_url", () => {
 // applyCacheOverrides — contract mirror of src/api/chatCompletions.ts
 // ---------------------------------------------------------------------------
 
-function applyCacheOverrides(systemBlocks, env) {
+function applyCacheOverrides(systemBlocks, env, model) {
   for (const block of systemBlocks) {
     if (!block.cache_control) continue;
 
@@ -1018,8 +1012,8 @@ function applyCacheOverrides(systemBlocks, env) {
       continue;
     }
 
-    const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
-    block.cache_control = { type: "ephemeral", ttl };
+    const ttl = getAnthropicCacheTtl(env, model);
+    block.cache_control = ttl ? { type: "ephemeral", ttl } : undefined;
   }
 }
 
@@ -1034,7 +1028,7 @@ check("cache_control on anchor layers only (client_system + summary in base ctx)
   const assembled = assemble(ctx);
   const anthropicSystem = assembledToAnthropicSystem(assembled.system_blocks);
 
-  // Base ctx has a summaryEntry and no dailyContext → exactly two anchors
+  // Base ctx has a summaryEntry → exactly two anchors
   const withCache = anthropicSystem.filter((b) => b.cache_control);
   assert.strictEqual(withCache.length, 2);
 
@@ -1328,11 +1322,121 @@ check("assembler receives non-null pinnedPersonaMemories (not null fallback)", (
 // buildAnthropicRequestFromAssembled: src/proxy/anthropicAdapter.ts
 // ---------------------------------------------------------------------------
 
-function buildOpenAIRequestFromAssembled(req, targetModel, assembled) {
-  const messages = assembledToOpenAIChatMessages(assembled);
-  const cleaned = { ...req, messages };
+function isOpenRouterAnthropicModel(model) {
+  return model.toLowerCase().startsWith("openrouter/anthropic/");
+}
+
+function getOpenRouterAnthropicCacheTtl(env, model) {
+  if (env.ANTHROPIC_CACHE_ENABLED === "false") return null;
+  if (model.toLowerCase() === "openrouter/anthropic/claude-fable-5") return "5m";
+  return env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+}
+
+function buildOpenRouterCacheControl(env, model) {
+  const ttl = getOpenRouterAnthropicCacheTtl(env, model);
+  if (!ttl) return undefined;
+  return ttl === "1h" ? { type: "ephemeral", ttl } : { type: "ephemeral" };
+}
+
+function splitOpenRouterDynamicBlocks(assembled) {
+  const volatileIndex = assembled.meta.block_ids.indexOf("client_volatile_context");
+  const memoryIndex = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
+  const removed = new Set([volatileIndex, memoryIndex].filter((index) => index >= 0));
+  return {
+    systemBlocks: assembled.system_blocks.filter((_, index) => !removed.has(index)),
+    volatileContext: volatileIndex >= 0 ? assembled.system_blocks[volatileIndex]?.text ?? null : null,
+    dynamicMemoryPatch: memoryIndex >= 0 ? assembled.system_blocks[memoryIndex]?.text ?? null : null,
+  };
+}
+
+function cloneOpenRouterContentParts(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (!Array.isArray(content)) return [{ type: "text", text: "" }];
+  return content.map((part) => part && typeof part === "object" && !Array.isArray(part) ? { ...part } : part);
+}
+
+function applyOpenRouterRollingCache(messages, cacheControl, env) {
+  if (!cacheControl || env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    const parts = cloneOpenRouterContentParts(message.content);
+    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = parts[partIndex];
+      if (!part || typeof part !== "object" || Array.isArray(part) || part.type !== "text") continue;
+      parts[partIndex] = { ...part, cache_control: cacheControl };
+      message.content = parts;
+      return;
+    }
+    parts.push({ type: "text", text: "", cache_control: cacheControl });
+    message.content = parts;
+    return;
+  }
+}
+
+function appendOpenRouterUncachedContext(messages, text) {
+  const trimmed = text?.trim();
+  if (!trimmed) return;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    const parts = cloneOpenRouterContentParts(message.content);
+    parts.push({ type: "text", text: trimmed });
+    message.content = parts;
+    return;
+  }
+  messages.push({ role: "user", content: [{ type: "text", text: trimmed }] });
+}
+
+function buildOpenRouterAnthropicMessages(assembled, env, targetModel, postUserInstructions) {
+  const cacheControl = buildOpenRouterCacheControl(env, targetModel);
+  const { systemBlocks, volatileContext, dynamicMemoryPatch } = splitOpenRouterDynamicBlocks(assembled);
+  const messages = [];
+  if (systemBlocks.length > 0) {
+    messages.push({
+      role: "system",
+      content: systemBlocks.map((block) => ({
+        type: "text",
+        text: block.text,
+        ...(block.cache_control && cacheControl ? { cache_control: cacheControl } : {}),
+      })),
+    });
+  }
+  messages.push(...assembledToOpenAIMessages(assembled.messages).map((message) => ({
+    ...message,
+    content: Array.isArray(message.content) ? cloneOpenRouterContentParts(message.content) : message.content,
+  })));
+  applyOpenRouterRollingCache(messages, cacheControl, env);
+  appendOpenRouterUncachedContext(messages, postUserInstructions);
+  appendOpenRouterUncachedContext(messages, volatileContext);
+  appendOpenRouterUncachedContext(messages, dynamicMemoryPatch);
+  return messages;
+}
+
+function buildOpenAIRequestFromAssembled(req, targetModel, assembled, env) {
+  const postUserInstructions = typeof req.post_user_instructions === "string"
+    ? req.post_user_instructions.trim() || null
+    : null;
+  const cleaned = { ...req };
   delete cleaned.thinking;
-  return { ...cleaned, model: targetModel, stream: Boolean(cleaned.stream) };
+  delete cleaned.post_user_instructions;
+  delete cleaned.context_epoch;
+  delete cleaned.context_compaction;
+  if (isOpenRouterAnthropicModel(targetModel) && env) {
+    if (typeof cleaned.conversation_id === "string" && typeof cleaned.session_id !== "string") {
+      cleaned.session_id = cleaned.conversation_id;
+    }
+    delete cleaned.conversation_id;
+    return {
+      ...cleaned,
+      messages: buildOpenRouterAnthropicMessages(assembled, env, targetModel, postUserInstructions),
+      model: targetModel,
+      stream: Boolean(cleaned.stream),
+    };
+  }
+  const messages = assembledToOpenAIChatMessages(assembled);
+  appendOpenRouterUncachedContext(messages, postUserInstructions);
+  return { ...cleaned, messages, model: targetModel, stream: Boolean(cleaned.stream) };
 }
 
 function getThinkingBudget(env) {
@@ -1453,16 +1557,26 @@ function getAnthropicMaxTokens(req, env) {
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
 }
 
-function buildCacheControl(env) {
-  if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
-  const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+function isCloudflareFableModel(model) {
+  return model?.toLowerCase() === "anthropic/claude-fable-5";
+}
+
+function getAnthropicCacheTtl(env, model) {
+  if (env.ANTHROPIC_CACHE_ENABLED === "false") return null;
+  if (isCloudflareFableModel(model)) return "5m";
+  return env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+}
+
+function buildCacheControl(env, model) {
+  const ttl = getAnthropicCacheTtl(env, model);
+  if (!ttl) return undefined;
   return ttl === "1h" ? { type: "ephemeral", ttl } : { type: "ephemeral" };
 }
 
-function buildAutomaticCacheControl(env) {
+function buildAutomaticCacheControl(env, model) {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
   if (env.ANTHROPIC_AUTO_CACHE_ENABLED !== "true") return undefined;
-  return buildCacheControl(env);
+  return buildCacheControl(env, model);
 }
 
 function getRollingCacheWindowSize(env) {
@@ -1471,8 +1585,8 @@ function getRollingCacheWindowSize(env) {
   return Math.max(Math.floor(value), 1);
 }
 
-function applyRollingMessageCache(messages, env) {
-  const cacheControl = buildCacheControl(env);
+function applyRollingMessageCache(messages, env, model) {
+  const cacheControl = buildCacheControl(env, model);
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
@@ -1522,19 +1636,37 @@ function buildAnthropicRequestFromAssembled(req, targetModel, assembled, env) {
   const thinking = buildThinkingConfig(env, req);
   const { systemBlocks, dynamicMemoryPatch } = splitDynamicMemorySystemBlock(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
-  applyCacheOverrides(system, env);
+  applyCacheOverrides(system, env, targetModel);
   const messages = assembledToAnthropicMessages(assembled.messages);
-  applyRollingMessageCache(messages, env);
+  applyRollingMessageCache(messages, env, targetModel);
+  appendUncachedUserContext(messages, req.post_user_instructions);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
   return {
     model: targetModel.replace(/^anthropic\//i, ""),
     max_tokens: getAnthropicMaxTokens(req, env),
-    cache_control: buildAutomaticCacheControl(env),
+    cache_control: buildAutomaticCacheControl(env, targetModel),
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     system,
     messages,
+  };
+}
+
+function buildCloudflareFableRequest(body) {
+  return {
+    max_tokens: body.max_tokens,
+    stream: body.stream,
+    thinking: { type: "adaptive" },
+    output_config: { effort: "high" },
+    system: body.system.map((block) => block.text).filter(Boolean).join("\n\n") || undefined,
+    messages: body.messages.map((message) => ({
+      role: message.role,
+      content: message.content.map((block) => ({
+        ...block,
+        ...(block.cache_control ? { cache_control: { type: "ephemeral" } } : {}),
+      })),
+    })),
   };
 }
 
@@ -1593,6 +1725,147 @@ check("OpenAI helper: strips Claude native thinking but keeps reasoning_effort",
   );
   assert.strictEqual("thinking" in req, false);
   assert.strictEqual(req.reasoning_effort, "high");
+});
+
+check("OpenAI helper: appends post-user instructions without forwarding the proxy field", () => {
+  const assembled = assemble(makeBaseCtx());
+  const req = buildOpenAIRequestFromAssembled(
+    {
+      model: "companion",
+      messages: [],
+      post_user_instructions: "<thinking-style>先充分思考</thinking-style>",
+    },
+    "deepseek/deepseek-v4-pro",
+    assembled
+  );
+  const lastUser = [...req.messages].reverse().find((message) => message.role === "user");
+  assert.strictEqual("post_user_instructions" in req, false);
+  assert.ok(Array.isArray(lastUser.content));
+  assert.ok(lastUser.content.at(-1).text.includes("<thinking-style>"));
+});
+
+check("OpenAI helper: strips context compaction control fields before upstream", () => {
+  const assembled = assemble(makeBaseCtx());
+  const req = buildOpenAIRequestFromAssembled(
+    {
+      model: "companion",
+      messages: [],
+      context_epoch: 2,
+      context_compaction: {
+        epoch: 2,
+        messages: [{ role: "user", content: "旧上下文" }],
+      },
+    },
+    "deepseek/deepseek-v4-pro",
+    assembled
+  );
+  assert.strictEqual("context_epoch" in req, false);
+  assert.strictEqual("context_compaction" in req, false);
+});
+
+check("OpenRouter Claude helper: keeps layered anchors and rolling user cache", () => {
+  const ctx = makeBaseCtx();
+  ctx.systemMessages = [{ role: "system", content: "测试角色\n当前时间: 2026-07-19 12:34 周日" }];
+  ctx.ragMemories = [{ type: "note", importance: 0.8, content: "动态记忆不进入缓存前缀" }];
+  const assembled = assemble(ctx);
+  const req = buildOpenAIRequestFromAssembled(
+    {
+      model: "companion",
+      messages: [],
+      conversation_id: "garden-session-1",
+      reasoning_effort: "high",
+      thinking: { type: "enabled" },
+      post_user_instructions: "<thinking-style>先充分思考</thinking-style>",
+    },
+    "openrouter/anthropic/claude-opus-4.7",
+    assembled,
+    { ANTHROPIC_CACHE_TTL: "1h" }
+  );
+
+  assert.strictEqual(req.model, "openrouter/anthropic/claude-opus-4.7");
+  assert.strictEqual(req.session_id, "garden-session-1");
+  assert.strictEqual("conversation_id" in req, false);
+  assert.strictEqual("thinking" in req, false);
+  assert.strictEqual("post_user_instructions" in req, false);
+  assert.strictEqual(req.reasoning_effort, "high");
+
+  const system = req.messages[0];
+  assert.strictEqual(system.role, "system");
+  assert.ok(Array.isArray(system.content));
+  const systemCachePoints = system.content.filter((part) => part.cache_control);
+  assert.ok(systemCachePoints.length >= 1);
+  assert.ok(systemCachePoints.every((part) => part.cache_control.ttl === "1h"));
+  assert.ok(!system.content.some((part) => part.text?.includes("当前时间: 2026-07-19 12:34")));
+  assert.ok(!system.content.some((part) => part.text?.includes("动态记忆不进入缓存前缀")));
+
+  const lastUser = [...req.messages].reverse().find((message) => message.role === "user");
+  assert.ok(Array.isArray(lastUser.content));
+  const rollingIndex = lastUser.content.findIndex((part) => part.cache_control);
+  const thinkingStyleIndex = lastUser.content.findIndex((part) => part.text?.includes("<thinking-style>"));
+  const volatileIndex = lastUser.content.findIndex((part) => part.text?.includes("当前时间: 2026-07-19 12:34"));
+  const memoryIndex = lastUser.content.findIndex((part) => part.text?.includes("动态记忆不进入缓存前缀"));
+  assert.ok(rollingIndex >= 0);
+  assert.ok(thinkingStyleIndex > rollingIndex);
+  assert.ok(volatileIndex > thinkingStyleIndex);
+  assert.ok(memoryIndex > volatileIndex);
+  assert.deepStrictEqual(lastUser.content[rollingIndex].cache_control, { type: "ephemeral", ttl: "1h" });
+  assert.ok(systemCachePoints.length + 1 <= 4, "Anthropic explicit cache breakpoints must stay within four");
+});
+
+check("OpenRouter Fable helper: forces 5m while other Claude models keep global 1h", () => {
+  const assembled = assemble(makeBaseCtx());
+  const env = { ANTHROPIC_CACHE_TTL: "1h" };
+  const fable = buildOpenAIRequestFromAssembled(
+    { model: "companion", messages: [] },
+    "openrouter/anthropic/claude-fable-5",
+    assembled,
+    env
+  );
+  const opus = buildOpenAIRequestFromAssembled(
+    { model: "companion", messages: [] },
+    "openrouter/anthropic/claude-opus-4.7",
+    assembled,
+    env
+  );
+  const fableCachePoints = fable.messages
+    .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .filter((part) => part?.cache_control);
+  const opusCachePoints = opus.messages
+    .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .filter((part) => part?.cache_control);
+
+  assert.ok(fableCachePoints.length >= 1);
+  assert.ok(fableCachePoints.every((part) => part.cache_control.ttl === undefined));
+  assert.ok(opusCachePoints.length >= 1);
+  assert.ok(opusCachePoints.every((part) => part.cache_control.ttl === "1h"));
+  assert.strictEqual(getOpenRouterAnthropicCacheTtl(env, fable.model), "5m");
+  assert.strictEqual(getOpenRouterAnthropicCacheTtl(env, opus.model), "1h");
+});
+
+check("OpenRouter Claude helper: cache can be disabled without affecting model routing", () => {
+  const assembled = assemble(makeBaseCtx());
+  const req = buildOpenAIRequestFromAssembled(
+    { model: "companion", messages: [] },
+    "openrouter/anthropic/claude-haiku-4.5",
+    assembled,
+    { ANTHROPIC_CACHE_ENABLED: "false" }
+  );
+  assert.strictEqual(req.model, "openrouter/anthropic/claude-haiku-4.5");
+  const cachePoints = req.messages
+    .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .filter((part) => part?.cache_control);
+  assert.strictEqual(cachePoints.length, 0);
+});
+
+check("provider classifier: OpenRouter Claude stays OpenAI-compatible", () => {
+  const classifyProvider = (model) => {
+    const value = model.toLowerCase();
+    if (value.startsWith("openrouter/")) return "openai-compatible";
+    return value.includes("anthropic") || value.includes("claude") ? "anthropic" : "openai-compatible";
+  };
+  assert.strictEqual(classifyProvider("openrouter/anthropic/claude-opus-4.7"), "openai-compatible");
+  assert.strictEqual(classifyProvider("anthropic/claude-fable-5"), "anthropic");
+  assert.strictEqual(classifyProvider("claude-opus-4-6"), "anthropic");
 });
 
 check("Anthropic helper: system cache_control stays on anchor layers", () => {
@@ -1659,7 +1932,10 @@ check("Anthropic helper: dynamic memory is appended after rolling cache point", 
   ctx.currentUserMessage = { role: "user", content: "继续优化缓存" };
   const assembled = assemble(ctx);
   const req = buildAnthropicRequestFromAssembled(
-    { messages: [] },
+    {
+      messages: [],
+      post_user_instructions: "<thinking-style>先充分思考</thinking-style>",
+    },
     "anthropic/claude-sonnet-4-6",
     assembled,
     {}
@@ -1671,8 +1947,10 @@ check("Anthropic helper: dynamic memory is appended after rolling cache point", 
   assert.ok(lastUser);
   assert.strictEqual(lastUser.content[0].text, "继续优化缓存");
   assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral" });
-  assert.ok(lastUser.content[1].text.includes("用户喜欢缓存命中率高一点"));
+  assert.ok(lastUser.content[1].text.includes("<thinking-style>"));
+  assert.ok(lastUser.content[2].text.includes("用户喜欢缓存命中率高一点"));
   assert.strictEqual(lastUser.content[1].cache_control, undefined);
+  assert.strictEqual(lastUser.content[2].cache_control, undefined);
 });
 
 check("Anthropic helper: ANTHROPIC_CACHE_ENABLED=false removes cache_control", () => {
@@ -1707,6 +1985,31 @@ check("Anthropic helper: ANTHROPIC_CACHE_TTL=1h sets ttl=1h", () => {
   assert.deepStrictEqual(anchor.cache_control, { type: "ephemeral", ttl: "1h" });
   const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
   assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral", ttl: "1h" });
+});
+
+check("Cloudflare Fable helper: preserves explicit message blocks with forced 5m cache", () => {
+  const ctx = makeBaseCtx();
+  ctx.ragMemories = [{ type: "note", importance: 0.8, content: "这段动态记忆不进缓存" }];
+  const assembled = assemble(ctx);
+  const native = buildAnthropicRequestFromAssembled(
+    { messages: [] },
+    "anthropic/claude-fable-5",
+    assembled,
+    { ANTHROPIC_CACHE_TTL: "1h" }
+  );
+  const fable = buildCloudflareFableRequest(native);
+  const lastUser = [...fable.messages].reverse().find((message) => message.role === "user");
+  const cacheIndex = lastUser.content.findIndex((block) => block.cache_control);
+  const dynamicIndex = lastUser.content.findIndex((block) => block.text.includes("这段动态记忆不进缓存"));
+
+  assert.strictEqual(getAnthropicCacheTtl({ ANTHROPIC_CACHE_TTL: "1h" }, "anthropic/claude-fable-5"), "5m");
+  assert.strictEqual(getAnthropicCacheTtl({ ANTHROPIC_CACHE_TTL: "1h" }, "anthropic/claude-opus-4-6"), "1h");
+  assert.strictEqual(typeof fable.system, "string");
+  assert.ok(Array.isArray(lastUser.content));
+  assert.ok(cacheIndex >= 0);
+  assert.deepStrictEqual(lastUser.content[cacheIndex].cache_control, { type: "ephemeral" });
+  assert.ok(dynamicIndex > cacheIndex);
+  assert.strictEqual(lastUser.content[dynamicIndex].cache_control, undefined);
 });
 
 check("Anthropic helper: defaults to stable system plus rolling cache", () => {
@@ -3259,27 +3562,6 @@ check("assembler: summary block position is after client_system (own cache layer
   assert.deepStrictEqual(assembled.system_blocks[summaryIdx].cache_control, { type: "ephemeral", ttl: "5m" });
 });
 
-check("assembler: daily_context sits between client_system and long_term_summary", () => {
-  const ctx = makeBaseCtx();
-  ctx.dailyContext = "今天的日期：2026年7月5日星期日";
-  ctx.summaryEntry = { content: "测试摘要" };
-  const assembled = assemble(ctx);
-  const csIdx = assembled.meta.block_ids.indexOf("client_system");
-  const dailyIdx = assembled.meta.block_ids.indexOf("daily_context");
-  const summaryIdx = assembled.meta.block_ids.indexOf("long_term_summary");
-  assert.ok(dailyIdx > csIdx, "daily_context should come after client_system");
-  assert.ok(summaryIdx > dailyIdx, "long_term_summary should come after daily_context");
-  assert.deepStrictEqual(assembled.system_blocks[dailyIdx].cache_control, { type: "ephemeral", ttl: "5m" });
-  assert.strictEqual(assembled.meta.anchor_index, csIdx, "anchor_index should still point at client_system");
-});
-
-check("assembler: empty dailyContext skips the daily_context block", () => {
-  const ctx = makeBaseCtx();
-  ctx.dailyContext = "   ";
-  const assembled = assemble(ctx);
-  assert.strictEqual(assembled.meta.block_ids.indexOf("daily_context"), -1);
-});
-
 // ---------------------------------------------------------------------------
 // Test 18: Queue Send / Fallback
 // ---------------------------------------------------------------------------
@@ -3365,6 +3647,103 @@ check("queue: send failure propagates (no silent swallow in producer)", () => {
     () => { throw new Error("should have rejected"); },
     (err) => { assert.strictEqual(err.message, "queue full"); }
   );
+});
+
+// ---------------------------------------------------------------------------
+// Test 19: Conversation Context Epoch / Window Compaction
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Test 19: Conversation Context Epoch / Window Compaction ---");
+
+const WINDOW_SUMMARY_MAX_CHARS_VERIFY = 1_200;
+const LONG_TERM_STATE_MAX_CHARS_VERIFY = 700;
+
+function integerEpochMirror(value) {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null;
+}
+
+function parseContextCompactionMirror(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const epoch = integerEpochMirror(value.epoch);
+  if (epoch === null || epoch < 1 || !Array.isArray(value.messages)) return null;
+
+  const messages = [];
+  let chars = 0;
+  for (const item of value.messages.slice(0, 60)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    if (item.role !== "user" && item.role !== "assistant") continue;
+    const content = typeof item.content === "string" ? item.content.trim() : "";
+    if (!content) continue;
+    chars += content.length;
+    if (chars > 80_000) throw new Error("context_compaction is too large");
+    messages.push({ role: item.role, content });
+  }
+  return messages.length > 0 ? { epoch, messages } : null;
+}
+
+function truncateContextStateMirror(text, limit) {
+  const normalized = text.trim();
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+function buildConversationStateSummaryMirror(longTermSummary, windowSummary) {
+  const parts = [];
+  if (longTermSummary?.trim()) {
+    parts.push(
+      `[长期背景]\n${truncateContextStateMirror(longTermSummary, LONG_TERM_STATE_MAX_CHARS_VERIFY)}`,
+    );
+  }
+  if (windowSummary?.trim()) {
+    parts.push(
+      `[此前窗口]\n${truncateContextStateMirror(windowSummary, WINDOW_SUMMARY_MAX_CHARS_VERIFY)}`,
+    );
+  }
+  return parts.length > 0 ? { content: parts.join("\n\n") } : null;
+}
+
+check("context epoch: accepts a valid complete-turn compaction payload", () => {
+  const parsed = parseContextCompactionMirror({
+    epoch: 3,
+    messages: [
+      { role: "user", content: "  第一问  " },
+      { role: "assistant", content: "第一答" },
+      { role: "tool", content: "不得进入摘要" },
+      { role: "assistant", content: "" },
+    ],
+  });
+  assert.deepStrictEqual(parsed, {
+    epoch: 3,
+    messages: [
+      { role: "user", content: "第一问" },
+      { role: "assistant", content: "第一答" },
+    ],
+  });
+});
+
+check("context epoch: rejects invalid epochs and empty transcripts", () => {
+  assert.strictEqual(parseContextCompactionMirror({ epoch: 0, messages: [] }), null);
+  assert.strictEqual(
+    parseContextCompactionMirror({ epoch: 1, messages: [{ role: "tool", content: "x" }] }),
+    null,
+  );
+});
+
+check("context epoch: combined state keeps long-term before rolling window", () => {
+  const summary = buildConversationStateSummaryMirror("长期事实", "上一窗口决定");
+  assert.deepStrictEqual(summary, {
+    content: "[长期背景]\n长期事实\n\n[此前窗口]\n上一窗口决定",
+  });
+});
+
+check("context epoch: frozen state blocks have deterministic size limits", () => {
+  const summary = buildConversationStateSummaryMirror("长".repeat(900), "窗".repeat(1_500));
+  assert.ok(summary);
+  const [longBlock, windowBlock] = summary.content.split("\n\n");
+  assert.strictEqual(longBlock.replace("[长期背景]\n", "").length, LONG_TERM_STATE_MAX_CHARS_VERIFY);
+  assert.strictEqual(windowBlock.replace("[此前窗口]\n", "").length, WINDOW_SUMMARY_MAX_CHARS_VERIFY);
+  assert.ok(longBlock.endsWith("..."));
+  assert.ok(windowBlock.endsWith("..."));
 });
 
 // ---------------------------------------------------------------------------

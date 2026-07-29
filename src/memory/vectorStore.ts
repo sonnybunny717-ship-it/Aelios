@@ -1,4 +1,8 @@
 import type { Env, MemoryApiRecord } from "../types";
+import {
+  deleteVectorMemorySource,
+  upsertVectorMemorySource,
+} from "../db/vectorMemorySources";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 import { createEmbedding } from "./embedding";
@@ -220,6 +224,18 @@ export async function createVectorMemory(env: Env, input: VectorMemoryInput): Pr
       metadata: toMetadata(normalized)
     }
   ]);
+  try {
+    await upsertVectorMemorySource(env.DB, {
+      namespace: normalized.namespace,
+      memory_id: id,
+      vector_id: vectorId,
+      type: normalized.type,
+      source_message_ids: JSON.stringify(normalized.sourceMessageIds),
+    });
+  } catch (error) {
+    await requireVectorize(env).deleteByIds([vectorId]).catch(() => {});
+    throw error;
+  }
 
   return {
     id,
@@ -260,6 +276,7 @@ export async function deleteVectorMemory(env: Env, id: string): Promise<boolean>
   const vectorIds = existing?.vector_id ? [existing.vector_id] : candidateVectorIds(id);
   if (vectorIds.length === 0) return false;
   await requireVectorize(env).deleteByIds(vectorIds);
+  if (existing) await deleteVectorMemorySource(env.DB, existing.namespace, existing.id);
   return true;
 }
 
@@ -305,6 +322,13 @@ export async function updateVectorMemory(
       metadata: toMetadata(next)
     }
   ]);
+  await upsertVectorMemorySource(env.DB, {
+    namespace: next.namespace,
+    memory_id: next.id,
+    vector_id: vectorId,
+    type: next.type,
+    source_message_ids: JSON.stringify(next.sourceMessageIds),
+  });
 
   return {
     ...existing,

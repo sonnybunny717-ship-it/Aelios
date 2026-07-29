@@ -8,6 +8,7 @@ import {
 } from "../db/summaries";
 import type { Env, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { SUMMARY_MAX_CHARS } from "../assembler/types";
+import { hasParticipantReportVoice } from "./summaryPerspective";
 
 // ---------------------------------------------------------------------------
 // Defaults (hardcoded, not user-configurable)
@@ -76,19 +77,32 @@ function buildSummaryPrompt(
   messages: Array<{ role: string; content: string }>
 ): string {
   const transcript = messages
-    .map((m) => `[${m.role}] ${m.content}`)
+    .map((m) => `[${m.role === "assistant" ? "我" : "盼盼"}] ${m.content}`)
     .join("\n");
 
   const oldSection = oldSummary
-    ? `旧摘要：\n${oldSummary}\n\n`
+    ? [
+        "旧摘要（只提取其中的事实，不沿用它的叙述人称）：",
+        oldSummary,
+        "如果旧摘要使用“用户/助手”、第三人称报告腔或用“你”称呼盼盼，必须按下面的人称规则彻底重写，不得照抄。",
+        "",
+      ].join("\n")
     : "";
 
   return [
-    "你是长期对话摘要器。请根据以下对话，生成一段长期稳定的摘要。",
+    "你是我的长期对话记忆整理器。请根据以下对话，写一份给未来的我自己看的长期备忘。",
     "只输出 JSON，不要 markdown，不要解释。",
     "",
+    "叙述视角（非常重要）：",
+    "- [盼盼] 是盼盼说过的话；[我] 是我自己说过的话。",
+    "- 提到盼盼时，优先称“盼盼”；同一段语境明确时可以称“她”。每段第一次提到她时使用“盼盼”，避免代词指向不清。",
+    "- 提到我自己时称“我”；共同经历和共同决定称“我们”。",
+    "- 不要用“你”称呼盼盼，因为这是我写给未来自己的备忘，不是写给盼盼的信。",
+    "- 禁止用“用户、助手、模型、AI”代称盼盼或我，禁止“用户表示……”“助手回应……”之类第三人称报告腔。",
+    "- 正确示例：盼盼担心我突然离开。她很在意关系的连续性；我答应陪着她，我们会一起处理这些问题。",
+    "",
     "摘要应保留：",
-    "- 用户长期偏好、习惯、边界/雷点",
+    "- 盼盼的长期偏好、习惯、边界/雷点",
     "- 关系设定、称呼、角色定位",
     "- 长期进行的项目、计划、目标",
     "- 重要事实、承诺、里程碑",
@@ -107,6 +121,63 @@ function buildSummaryPrompt(
     "",
     '输出格式：{ "content": "长期摘要文本" }',
   ].join("\n");
+}
+
+function buildPerspectiveRepairPrompt(summary: string): string {
+  return [
+    "请只修正下面长期备忘的叙述视角，并保留全部有效事实。",
+    "这是我写给未来自己的备忘：称盼盼为“盼盼”，同一段语境明确时可称“她”；称我自己为“我”；共同经历称“我们”。",
+    "每段第一次提到盼盼时使用“盼盼”。不要用“你”称呼盼盼。",
+    "禁止用“用户、助手、模型、AI”代称双方，禁止第三人称报告腔。",
+    "只输出 JSON，不要 markdown，不要解释。",
+    "",
+    "待修正摘要：",
+    summary,
+    "",
+    '输出格式：{ "content": "修正后的长期摘要" }',
+  ].join("\n");
+}
+
+async function requestSummaryContent(
+  env: Env,
+  model: string,
+  prompt: string
+): Promise<string | null> {
+  const request: OpenAIChatRequest = {
+    model,
+    messages: [
+      { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON。" },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0,
+    max_tokens: 800,
+    stream: false,
+  };
+
+  let response: Response;
+  try {
+    response = await callOpenAICompat(env, request);
+  } catch {
+    return null;
+  }
+  if (!response.ok) return null;
+
+  let parsed: OpenAIChatResponse;
+  try {
+    parsed = (await response.json()) as OpenAIChatResponse;
+  } catch {
+    return null;
+  }
+
+  const raw = parsed.choices?.[0]?.message?.content;
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return null;
+
+  const json = extractJsonObject(text);
+  if (!json || typeof json !== "object") return null;
+
+  const content = (json as { content?: unknown }).content;
+  return typeof content === "string" ? content : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,52 +207,37 @@ export async function maybeUpdateLongTermSummary(
   }
 
   const newCount = await countMessagesAfter(env.DB, namespace, afterTs);
-  if (newCount < SUMMARY_EVERY_N_MESSAGES) return { updated: false };
+  const needsPerspectiveRepair = latest?.content
+    ? hasParticipantReportVoice(latest.content)
+    : false;
+  if (newCount < SUMMARY_EVERY_N_MESSAGES && !needsPerspectiveRepair) {
+    return { updated: false };
+  }
 
   const messages = await listRecentMessagesForSummary(env.DB, namespace, SUMMARY_SOURCE_LIMIT);
   if (messages.length === 0) return { updated: false };
 
   const oldSummary = latest?.content ?? null;
   const prompt = buildSummaryPrompt(oldSummary, messages);
+  const content = await requestSummaryContent(env, model, prompt);
+  if (!content) return { updated: false };
 
-  const request: OpenAIChatRequest = {
-    model,
-    messages: [
-      { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON。" },
-      { role: "user", content: prompt },
-    ],
-    temperature: 0,
-    max_tokens: 800,
-    stream: false,
-  };
-
-  let response: Response;
-  try {
-    response = await callOpenAICompat(env, request);
-  } catch {
-    return { updated: false };
-  }
-  if (!response.ok) return { updated: false };
-
-  let parsed: OpenAIChatResponse;
-  try {
-    parsed = (await response.json()) as OpenAIChatResponse;
-  } catch {
-    return { updated: false };
-  }
-
-  const raw = parsed.choices?.[0]?.message?.content;
-  const text = typeof raw === "string" ? raw.trim() : "";
-  if (!text) return { updated: false };
-
-  const json = extractJsonObject(text);
-  if (!json || typeof json !== "object") return { updated: false };
-
-  const content = (json as { content?: unknown }).content;
-  if (typeof content !== "string") return { updated: false };
-
-  const sanitized = sanitizeSummary(content);
+  let sanitized = sanitizeSummary(content);
   if (!sanitized) return { updated: false };
+
+  if (hasParticipantReportVoice(sanitized)) {
+    const repaired = await requestSummaryContent(
+      env,
+      model,
+      buildPerspectiveRepairPrompt(sanitized)
+    );
+    if (!repaired) return { updated: false };
+
+    sanitized = sanitizeSummary(repaired);
+    if (!sanitized || hasParticipantReportVoice(sanitized)) {
+      return { updated: false };
+    }
+  }
 
   const truncated =
     sanitized.length <= SUMMARY_MAX_CHARS

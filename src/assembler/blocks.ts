@@ -151,24 +151,6 @@ const longTermSummaryBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 3.5: daily_context (stable, cache_anchor = true)
-// Once-per-day content (date line etc.). Sits between the client_system
-// anchor and the summary anchor so a new day only rewrites this layer down,
-// and a summary refresh does not touch it.
-// ---------------------------------------------------------------------------
-
-const dailyContextBlock: Block = {
-  id: "daily_context",
-  kind: "stable",
-  role: "system",
-  cache_anchor: true,
-  content_fn: (ctx: AssemblerContext): string | null => {
-    const text = ctx.dailyContext?.trim();
-    return text || null;
-  },
-};
-
-// ---------------------------------------------------------------------------
 // Block 4: preset_lite (stable)
 // Fixed string from plan §5.1, ≤300 chars, hardcoded constant.
 // ---------------------------------------------------------------------------
@@ -367,7 +349,6 @@ const BLOCK_MAP = new Map<string, Block>([
   [proxyStaticRulesBlock.id, proxyStaticRulesBlock],
   [personaPinnedBlock.id, personaPinnedBlock],
   [longTermSummaryBlock.id, longTermSummaryBlock],
-  [dailyContextBlock.id, dailyContextBlock],
   [presetLiteBlock.id, presetLiteBlock],
   [clientSystemBlock.id, clientSystemBlock],
   [clientVolatileContextBlock.id, clientVolatileContextBlock],
@@ -449,7 +430,7 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
     if (block.cache_anchor) {
       systemBlock.cache_control = { type: "ephemeral", ttl: "5m" };
       // anchor_index tracks the primary anchor (client_system) only;
-      // daily_context and long_term_summary carry their own cache_control.
+      // long_term_summary carries its own cache_control.
       if (block.id === "client_system") anchorIndex = systemBlocks.length;
     }
 

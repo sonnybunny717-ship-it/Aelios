@@ -22,6 +22,7 @@ interface CacheHealthRow {
   input_tokens: number | null;
   client_system_hash: string | null;
   cache_anchor_block: string | null;
+  cache_diagnostics_json: string | null;
 }
 
 interface ModelAgg {
@@ -412,7 +413,8 @@ export async function handleCacheHealth(request: Request, env: Env): Promise<Res
     const recent = await env.DB.prepare(
       `SELECT
          created_at, model, cache_read_tokens, cache_creation_tokens,
-         input_tokens, client_system_hash, cache_anchor_block
+         input_tokens, client_system_hash, cache_anchor_block,
+         cache_diagnostics_json
        FROM usage_logs
        WHERE created_at >= ? AND ${ANTHROPIC_FILTER}
        ORDER BY created_at DESC

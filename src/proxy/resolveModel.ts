@@ -22,5 +22,6 @@ export function resolveTargetModel(requestModel: string, profile: KeyProfile, en
 
 export function classifyProvider(model: string): "anthropic" | "openai-compatible" {
   const value = model.toLowerCase();
+  if (value.startsWith("openrouter/")) return "openai-compatible";
   return value.includes("anthropic") || value.includes("claude") ? "anthropic" : "openai-compatible";
 }

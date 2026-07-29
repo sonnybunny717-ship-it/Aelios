@@ -75,7 +75,16 @@ export function assembledToAnthropicMessages(
 
     const prev = result[result.length - 1];
     if (prev?.role === role) {
-      prev.content.push({ type: "text", text });
+      if (role === "assistant") {
+        const lastBlock = prev.content[prev.content.length - 1];
+        if (lastBlock.text && text) {
+          lastBlock.text = `${lastBlock.text}\n\n${text}`;
+        } else if (text) {
+          lastBlock.text = text;
+        }
+      } else {
+        prev.content.push({ type: "text", text });
+      }
       continue;
     }
 

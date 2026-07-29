@@ -19,6 +19,8 @@ interface AnthropicMessage {
   content: AnthropicTextBlock[];
 }
 
+type AdaptiveEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
 interface AnthropicRequest {
   model: string;
   max_tokens: number;
@@ -31,13 +33,41 @@ interface AnthropicRequest {
   };
   temperature?: number;
   stream?: boolean;
-  thinking?: {
-    type: "enabled";
-    budget_tokens: number;
-    display?: "summarized" | "omitted";
+  thinking?:
+    | {
+        type: "enabled";
+        budget_tokens: number;
+        display?: "summarized" | "omitted";
+      }
+    | {
+        type: "adaptive";
+        display?: "summarized" | "omitted";
+      }
+    | {
+        type: "disabled";
+      };
+  output_config?: {
+    effort: AdaptiveEffort;
   };
   system: AnthropicTextBlock[];
   messages: AnthropicMessage[];
+}
+
+interface CloudflareFableRequest {
+  max_tokens: number;
+  metadata?: AnthropicRequest["metadata"];
+  stream?: boolean;
+  thinking: {
+    type: "adaptive";
+  };
+  output_config: {
+    effort: "high";
+  };
+  system?: string;
+  messages: Array<{
+    role: AnthropicMessage["role"];
+    content: AnthropicTextBlock[];
+  }>;
 }
 
 interface AnthropicResponse {
@@ -59,6 +89,101 @@ function stripAnthropicProviderPrefix(model: string): string {
   return model.replace(/^anthropic\//i, "");
 }
 
+function isCloudflareFableModel(model: string): boolean {
+  return model.toLowerCase() === "anthropic/claude-fable-5";
+}
+
+function isClaudeOpus5Model(model: string): boolean {
+  return model.toLowerCase().replace(/^anthropic\//, "") === "claude-opus-5";
+}
+
+function getCloudflareAiGatewayId(env: Env): string {
+  if (env.AI_GATEWAY_ID) return env.AI_GATEWAY_ID;
+  try {
+    const url = new URL(env.AI_GATEWAY_BASE_URL || "");
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (url.hostname === "gateway.ai.cloudflare.com" && parts[0] === "v1") {
+      return parts[2] || "";
+    }
+  } catch {}
+  return "";
+}
+
+function joinAnthropicTextBlocks(blocks: AnthropicTextBlock[]): string {
+  return blocks.map((block) => block.text).filter(Boolean).join("\n\n");
+}
+
+function buildCloudflareFableRequest(body: AnthropicRequest): CloudflareFableRequest {
+  const system = joinAnthropicTextBlocks(body.system);
+  return {
+    max_tokens: body.max_tokens,
+    metadata: body.metadata,
+    stream: body.stream,
+    thinking: { type: "adaptive" },
+    output_config: { effort: "high" },
+    system: system || undefined,
+    messages: body.messages.map((message) => ({
+      role: message.role,
+      content: message.content.map((block) => ({
+        ...block,
+        ...(block.cache_control ? { cache_control: { type: "ephemeral" as const } } : {})
+      }))
+    }))
+  };
+}
+
+function normalizeAdaptiveEffort(value: unknown): AdaptiveEffort | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "minimal") return "low";
+  if (normalized === "auto") return "high";
+  if (normalized === "extra_high") return "xhigh";
+  return ["low", "medium", "high", "xhigh", "max"].includes(normalized)
+    ? normalized as AdaptiveEffort
+    : null;
+}
+
+function getAdaptiveEffort(req: OpenAIChatRequest): AdaptiveEffort {
+  const sources = [
+    req,
+    isRecord(req.extra_body) ? req.extra_body : null,
+    isRecord(req.extraBody) ? req.extraBody : null,
+  ];
+  for (const source of sources) {
+    if (!source) continue;
+    const direct = normalizeAdaptiveEffort(source.reasoning_effort);
+    if (direct) return direct;
+    if (isRecord(source.reasoning)) {
+      const nested = normalizeAdaptiveEffort(source.reasoning.effort);
+      if (nested) return nested;
+    }
+  }
+  return "high";
+}
+
+function applyModelThinkingMode(
+  body: AnthropicRequest,
+  req: OpenAIChatRequest,
+  targetModel: string
+): AnthropicRequest {
+  if (!isClaudeOpus5Model(targetModel)) return body;
+  const directive = getRequestThinkingDirective(req);
+  if (directive.enabled === false) {
+    return {
+      ...body,
+      temperature: undefined,
+      thinking: { type: "disabled" },
+      output_config: undefined,
+    };
+  }
+  return {
+    ...body,
+    temperature: undefined,
+    thinking: { type: "adaptive", display: "summarized" },
+    output_config: { effort: getAdaptiveEffort(req) },
+  };
+}
+
 function parseCustomProviderModel(model: string): { slug: string; model: string } | null {
   const match = model.match(/^custom-([a-z0-9-]+)\/(.+)$/i);
   if (!match) return null;
@@ -76,16 +201,23 @@ function getCustomAnthropicMessagesPath(env: Env): string {
   return (env.CUSTOM_ANTHROPIC_MESSAGES_PATH || "messages").replace(/^\/+/, "");
 }
 
-function buildCacheControl(env: Env): AnthropicTextBlock["cache_control"] | undefined {
+export function getAnthropicCacheTtl(env: Env, model?: string): "5m" | "1h" | null {
+  if (env.ANTHROPIC_CACHE_ENABLED === "false") return null;
+  if (model && isCloudflareFableModel(model)) return "5m";
+  return env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+}
+
+function buildCacheControl(env: Env, model?: string): AnthropicTextBlock["cache_control"] | undefined {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
-  const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+  const ttl = getAnthropicCacheTtl(env, model);
+  if (!ttl) return undefined;
   return ttl === "1h" ? { type: "ephemeral", ttl } : { type: "ephemeral" };
 }
 
-function buildAutomaticCacheControl(env: Env): AnthropicRequest["cache_control"] | undefined {
+function buildAutomaticCacheControl(env: Env, model?: string): AnthropicRequest["cache_control"] | undefined {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
   if (env.ANTHROPIC_AUTO_CACHE_ENABLED !== "true") return undefined;
-  return buildCacheControl(env);
+  return buildCacheControl(env, model);
 }
 
 function buildCacheMetadata(env: Env): AnthropicRequest["metadata"] | undefined {
@@ -102,8 +234,8 @@ export function getAnthropicCacheMode(env: Env): string | null {
   return parts.join("_");
 }
 
-function applyRollingMessageCache(messages: AnthropicMessage[], env: Env): void {
-  const cacheControl = buildCacheControl(env);
+function applyRollingMessageCache(messages: AnthropicMessage[], env: Env, model?: string): void {
+  const cacheControl = buildCacheControl(env, model);
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
@@ -131,6 +263,12 @@ function appendUncachedUserContext(messages: AnthropicMessage[], text: string | 
   }
 
   messages.push({ role: "user", content: [{ type: "text", text: trimmed }] });
+}
+
+function getPostUserInstructions(req: OpenAIChatRequest): string | null {
+  return typeof req.post_user_instructions === "string"
+    ? req.post_user_instructions.trim() || null
+    : null;
 }
 
 function splitDynamicSystemBlocks(
@@ -292,7 +430,7 @@ function getAnthropicMaxTokens(
   thinking: AnthropicRequest["thinking"] | undefined
 ): number {
   const maxTokens = getMaxTokens(req);
-  if (!thinking) return maxTokens;
+  if (!thinking || thinking.type !== "enabled") return maxTokens;
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
 }
 
@@ -368,7 +506,7 @@ export async function buildAnthropicNativeRequest(
   };
 
   if (input.env.ANTHROPIC_CACHE_STABLE_SYSTEM !== "false") {
-    stableBlock.cache_control = buildCacheControl(input.env);
+    stableBlock.cache_control = buildCacheControl(input.env, input.targetModel);
   }
 
   const dynamicMemoryPatch = formatMemoryPatch(input.memories);
@@ -386,20 +524,21 @@ export async function buildAnthropicNativeRequest(
   ];
 
   const messages = convertMessages(req.messages);
-  applyRollingMessageCache(messages, input.env);
+  applyRollingMessageCache(messages, input.env, input.targetModel);
+  appendUncachedUserContext(messages, getPostUserInstructions(req));
   appendUncachedUserContext(messages, dynamicMemoryPatch);
 
-  return {
+  return applyModelThinkingMode({
     model: stripAnthropicModelPrefix(input.targetModel),
     max_tokens: getAnthropicMaxTokens(req, input.env, thinking),
     metadata: buildCacheMetadata(input.env),
-    cache_control: buildAutomaticCacheControl(input.env),
+    cache_control: buildAutomaticCacheControl(input.env, input.targetModel),
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     system,
     messages
-  };
+  }, req, input.targetModel);
 }
 
 /**
@@ -424,27 +563,28 @@ export function buildAnthropicRequestFromAssembled(
   const { systemBlocks, dynamicMemoryPatch, volatileContext } = splitDynamicSystemBlocks(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
-  applyCacheOverrides(system, env);
-  applyRollingMessageCache(messages, env);
+  applyCacheOverrides(system, env, targetModel);
+  applyRollingMessageCache(messages, env, targetModel);
+  appendUncachedUserContext(messages, getPostUserInstructions(req));
   appendUncachedUserContext(messages, volatileContext);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
 
-  return {
+  return applyModelThinkingMode({
     model: stripAnthropicModelPrefix(targetModel),
     max_tokens: getAnthropicMaxTokens(req, env, thinking),
     metadata: buildCacheMetadata(env),
-    cache_control: buildAutomaticCacheControl(env),
+    cache_control: buildAutomaticCacheControl(env, targetModel),
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     system,
     messages,
-  };
+  }, req, targetModel);
 }
 
-function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void {
-  // Layered anchors: client_system, daily_context, and long_term_summary can
-  // each carry cache_control — override TTL (or strip) on every one of them.
+function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env, model?: string): void {
+  // Layered anchors: client_system and long_term_summary can each carry
+  // cache_control — override TTL (or strip) on every one of them.
   for (const block of systemBlocks) {
     if (!block.cache_control) continue;
 
@@ -453,12 +593,46 @@ function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void
       continue;
     }
 
-    const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
-    block.cache_control = { type: "ephemeral", ttl };
+    const ttl = getAnthropicCacheTtl(env, model);
+    block.cache_control = ttl ? { type: "ephemeral", ttl } : undefined;
   }
 }
 
 export async function callAnthropicNative(env: Env, body: AnthropicRequest, targetModel?: string): Promise<Response> {
+  const resolvedModel = targetModel || body.model;
+  if (isCloudflareFableModel(resolvedModel)) {
+    if (!env.AI) throw new Error("Missing Cloudflare AI binding");
+
+    const gatewayId = getCloudflareAiGatewayId(env);
+    const output: unknown = await env.AI.run(
+      resolvedModel as Parameters<Ai["run"]>[0],
+      buildCloudflareFableRequest(body) as unknown as Parameters<Ai["run"]>[1],
+      gatewayId ? { gateway: { id: gatewayId } } : undefined
+    );
+    const logId = (env.AI as Ai & { aiGatewayLogId?: string }).aiGatewayLogId;
+    if (output instanceof Response) {
+      if (!logId || output.headers.has("cf-aig-log-id")) return output;
+      const headers = new Headers(output.headers);
+      headers.set("cf-aig-log-id", logId);
+      return new Response(output.body, {
+        status: output.status,
+        statusText: output.statusText,
+        headers
+      });
+    }
+    if (output instanceof ReadableStream) {
+      return new Response(output, {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          ...(logId ? { "cf-aig-log-id": logId } : {})
+        }
+      });
+    }
+    return Response.json(output, {
+      headers: logId ? { "cf-aig-log-id": logId } : undefined
+    });
+  }
+
   return fetch(getAnthropicUrlForModel(env, targetModel || body.model), {
     method: "POST",
     headers: buildAnthropicHeaders(env),
