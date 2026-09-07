@@ -1,4 +1,5 @@
 import { saveAssistantMessage } from "../db/messages";
+import type { ReplyVariant } from "../db/replyVariants";
 import { saveUsageLog } from "../db/usageLogs";
 import { enqueueMemoryMaintenanceIfNeeded, enqueueRetentionIfNeeded } from "../queue/producer";
 import {
@@ -12,6 +13,7 @@ import { getSseData, splitSseEvents } from "../utils/sseParser";
 import { normalizeOpenAIUsage } from "./openaiAdapter";
 
 interface StreamOpenAIOptions {
+  replyVariant?: ReplyVariant;
   env: Env;
   ctx: ExecutionContext;
   profile: KeyProfile;
@@ -118,6 +120,7 @@ function filterOpenAISSEData(
 
 async function persistStreamResult(options: StreamOpenAIOptions, state: StreamState): Promise<void> {
   const messageId = await saveAssistantMessage(options.env.DB, {
+    replyVariant: options.replyVariant,
     conversationId: options.conversationId,
     namespace: options.profile.namespace,
     source: options.profile.source,
@@ -191,7 +194,9 @@ export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOpt
           const data = getSseData(event);
           if (!data) continue;
           const filtered = filterOpenAISSEData(data, state);
-          if (filtered) await writer.write(filtered);
+          if (filtered) await writer.write(options.replyVariant && data === "[DONE]"
+            ? new TextEncoder().encode(new TextDecoder().decode(filtered).replace("data: [DONE]\n\n", ""))
+            : filtered);
         }
       }
 
@@ -201,7 +206,9 @@ export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOpt
         const data = getSseData(event);
         if (!data) continue;
         const filtered = filterOpenAISSEData(data, state);
-        if (filtered) await writer.write(filtered);
+        if (filtered) await writer.write(options.replyVariant && data === "[DONE]"
+          ? new TextEncoder().encode(new TextDecoder().decode(filtered).replace("data: [DONE]\n\n", ""))
+          : filtered);
       }
 
       // Flush held trailing dash or unclosed <think> text at stream end.
@@ -214,8 +221,13 @@ export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOpt
         await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(trailingChunk)}\n\n`));
       }
 
+      if (options.replyVariant) {
+        if (!state.finishReason) throw new Error("Upstream stream ended without a finish reason");
+        await persistStreamResult(options, state);
+        await writer.write(new TextEncoder().encode("data: [DONE]\n\n"));
+      }
       await writer.close();
-      options.ctx.waitUntil(
+      if (!options.replyVariant) options.ctx.waitUntil(
         persistStreamResult(options, state).catch((error) => {
           console.error("failed to persist stream result", error);
         })

@@ -279,6 +279,9 @@ export async function handleDeleteConversation(request: Request, env: Env): Prom
 
   statements.push(
     env.DB
+      .prepare("DELETE FROM reply_selections WHERE conversation_id = ? AND namespace = ?")
+      .bind(conversationId, auth.profile.namespace),
+    env.DB
       .prepare("DELETE FROM messages WHERE conversation_id = ? AND namespace = ?")
       .bind(conversationId, auth.profile.namespace),
     env.DB
@@ -301,4 +304,33 @@ export async function handleDeleteConversation(request: Request, env: Env): Prom
       ]).size,
     },
   });
+}
+
+export async function invalidateMessageDerivatives(
+  env: Env, namespace: string, conversationId: string, messages: MessageRow[],
+): Promise<D1PreparedStatement[]> {
+  if (!messages.length) return [];
+  const ids = new Set(messages.map(message => message.id));
+  const memories = (await env.DB.prepare('SELECT id, type, vector_id, source_message_ids FROM memories WHERE namespace = ?')
+    .bind(namespace).all<DerivedMemoryRow>()).results.filter(memory => sourceIdsOverlap(parseStringArray(memory.source_message_ids), ids));
+  const vectors = await listDerivedVectorMemories(env, namespace, ids);
+  const summaries = (await env.DB.prepare(`SELECT s.id, s.conversation_id, s.from_message_id, s.to_message_id, s.vector_id,
+    fm.created_at AS from_created_at, tm.created_at AS to_created_at FROM summaries s
+    LEFT JOIN messages fm ON fm.id = s.from_message_id LEFT JOIN messages tm ON tm.id = s.to_message_id
+    WHERE s.namespace = ?`).bind(namespace).all<SummaryRow>()).results
+    .filter(summary => summaryContainsDeletedMessage(summary, conversationId, ids, messages.map(message => message.created_at)));
+  await deleteVectors(env, [...memories, ...vectors, ...summaries].map(row => row.vector_id || ''));
+  const statements = [
+    ...deleteByIds(env.DB, 'memory_events', 'memory_id', namespace, [...memories.map(row => row.id), ...vectors.map(row => row.memory_id)]),
+    ...deleteByIds(env.DB, 'memories', 'id', namespace, memories.map(row => row.id)),
+    ...deleteByIds(env.DB, 'summaries', 'id', namespace, summaries.map(row => row.id)),
+  ];
+  for (const batch of chunks(vectors.map(row => row.memory_id))) {
+    statements.push(env.DB.prepare(`DELETE FROM vector_memory_sources WHERE namespace = ? AND memory_id IN (${batch.map(() => '?').join(',')})`).bind(namespace, ...batch));
+  }
+  if (summaries.length) statements.push(env.DB.prepare('UPDATE conversations SET summary_snapshot = NULL, summary_snapshot_source_updated_at = NULL WHERE namespace = ?').bind(namespace));
+  if ([...memories, ...vectors].some(row => ['identity', 'persona'].includes(row.type))) {
+    statements.push(env.DB.prepare('UPDATE conversations SET persona_snapshot_json = NULL WHERE namespace = ?').bind(namespace));
+  }
+  return statements;
 }

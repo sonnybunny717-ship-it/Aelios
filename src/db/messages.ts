@@ -2,6 +2,7 @@ import type { MessageRecord, OpenAIChatMessage, TokenUsage } from "../types";
 import { sha256Hex } from "../utils/hash";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
+import type { ReplyVariant } from "./replyVariants";
 
 function contentToText(content: OpenAIChatMessage["content"]): string {
   if (typeof content === "string") return content;
@@ -20,6 +21,7 @@ export async function saveUserMessages(
     upstreamModel: string;
     upstreamProvider: string;
     stream: boolean;
+    replyVariant?: ReplyVariant;
   }
 ): Promise<string[]> {
   const lastUserMessage = [...input.messages].reverse().find((message) => message.role === "user");
@@ -36,8 +38,9 @@ export async function saveUserMessages(
       .prepare(
         `INSERT INTO messages (
           id, conversation_id, namespace, role, content, source, client_message_hash,
-          upstream_model, upstream_provider, request_model, stream, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          upstream_model, upstream_provider, request_model, stream, created_at,
+          client_turn_id, client_variant_id, memory_active
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         id,
@@ -51,7 +54,10 @@ export async function saveUserMessages(
         input.upstreamProvider,
         input.requestModel,
         input.stream ? 1 : 0,
-        nowIso()
+        nowIso(),
+        input.replyVariant?.turnId ?? null,
+        input.replyVariant?.variantId ?? null,
+        input.replyVariant ? 0 : 1
       )
       .run();
   }
@@ -74,6 +80,7 @@ export async function saveAssistantMessage(
     usage?: TokenUsage;
     cacheMode?: string | null;
     cacheTtl?: string | null;
+    replyVariant?: ReplyVariant;
   }
 ): Promise<string> {
   const id = newId("msg");
@@ -85,8 +92,9 @@ export async function saveAssistantMessage(
         id, conversation_id, namespace, role, content, source, upstream_model,
         upstream_provider, request_model, stream, finish_reason, token_input,
         token_output, cache_mode, cache_ttl, cache_hit, cache_read_tokens,
-        cache_creation_tokens, raw_usage_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        cache_creation_tokens, raw_usage_json, created_at,
+        client_turn_id, client_variant_id, memory_active
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -108,7 +116,10 @@ export async function saveAssistantMessage(
       usage.cache_read_input_tokens ?? null,
       usage.cache_creation_input_tokens ?? null,
       JSON.stringify(usage),
-      nowIso()
+      nowIso(),
+      input.replyVariant?.turnId ?? null,
+      input.replyVariant?.variantId ?? null,
+      input.replyVariant ? 0 : 1
     )
     .run();
 
@@ -126,7 +137,7 @@ export async function getMessagesByIds(
     .prepare(
       `SELECT id, conversation_id, namespace, role, content, source, created_at
        FROM messages
-       WHERE namespace = ? AND id IN (${placeholders})
+       WHERE namespace = ? AND memory_active = 1 AND id IN (${placeholders})
        ORDER BY created_at ASC`
     )
     .bind(input.namespace, ...input.ids)
@@ -144,7 +155,7 @@ export async function countMessagesAfterTimestamp(
     const row = await db
       .prepare(
         `SELECT COUNT(*) as cnt FROM messages
-         WHERE namespace = ? AND role IN ('user', 'assistant')`
+         WHERE namespace = ? AND memory_active = 1 AND role IN ('user', 'assistant')`
       )
       .bind(namespace)
       .first<{ cnt: number }>();
@@ -154,7 +165,7 @@ export async function countMessagesAfterTimestamp(
   const row = await db
     .prepare(
       `SELECT COUNT(*) as cnt FROM messages
-       WHERE namespace = ? AND role IN ('user', 'assistant') AND created_at > ?`
+       WHERE namespace = ? AND memory_active = 1 AND role IN ('user', 'assistant') AND created_at > ?`
     )
     .bind(namespace, afterCreatedAt)
     .first<{ cnt: number }>();
@@ -169,7 +180,7 @@ export async function listMessagesByNamespace(
 ): Promise<MessageRecord[]> {
   let sql = `SELECT id, conversation_id, namespace, role, content, source, created_at
              FROM messages
-             WHERE namespace = ? AND role IN ('user', 'assistant')`;
+             WHERE namespace = ? AND memory_active = 1 AND role IN ('user', 'assistant')`;
   const binds: unknown[] = [namespace];
 
   if (afterCreatedAt) {
@@ -196,7 +207,7 @@ export async function listMessagesByNamespaceInRange(
 ): Promise<MessageRecord[]> {
   let sql = `SELECT id, conversation_id, namespace, role, content, source, created_at
              FROM messages
-             WHERE namespace = ?
+             WHERE namespace = ? AND memory_active = 1
                AND role IN ('user', 'assistant')
                AND created_at >= ?
                AND created_at < ?`;

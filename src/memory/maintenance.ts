@@ -129,6 +129,11 @@ export async function runMemoryMaintenance(
     }
 
     const extraction = await extractMemoriesFromMessages(env, batch);
+    const selected = await getMessagesByIds(env.DB, { namespace: message.namespace, ids: batch.map(row => row.id) });
+    if (selected.length !== batch.length) {
+      await finishIdempotentTask(env.DB, { key: message.idempotencyKey, status: "failed" });
+      return { processed: false };
+    }
     const summaryContent = extraction.summary_patch || buildBatchSummary(batch);
     if (summaryContent) {
       const summaryMemory: ExtractedMemory = {

@@ -9,6 +9,7 @@ import { handleMcp } from "./api/mcp";
 import { handleModels } from "./api/models";
 import { handleBillingBalances } from "./api/billing";
 import { handleDeleteConversation } from "./api/conversations";
+import { handleReplySelection } from "./api/replySelection";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
 import { runMemoryRetention } from "./memory/retention";
 import { handleQueueMessage } from "./queue/consumer";
@@ -56,6 +57,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/v1/billing/balances") {
       return handleBillingBalances(request, env);
+    }
+
+    if (["GET", "POST"].includes(request.method) && /^\/v1\/conversations\/[^/]+\/reply-selection$/.test(url.pathname)) {
+      return handleReplySelection(request, env);
     }
 
     if (request.method === "DELETE" && url.pathname.startsWith("/v1/conversations/")) {

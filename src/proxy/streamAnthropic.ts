@@ -1,4 +1,5 @@
 import { saveAssistantMessage } from "../db/messages";
+import type { ReplyVariant } from "../db/replyVariants";
 import { saveUsageLog } from "../db/usageLogs";
 import { enqueueMemoryMaintenanceIfNeeded, enqueueRetentionIfNeeded } from "../queue/producer";
 import { getAnthropicCacheMode, getAnthropicCacheTtl, normalizeAnthropicUsage } from "./anthropicAdapter";
@@ -12,6 +13,7 @@ import type { Env, KeyProfile, TokenUsage } from "../types";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
 
 interface StreamAnthropicOptions {
+  replyVariant?: ReplyVariant;
   env: Env;
   ctx: ExecutionContext;
   profile: KeyProfile;
@@ -104,6 +106,7 @@ function consumeAnthropicData(data: string, state: StreamState): { content?: str
 
 async function persistStreamResult(options: StreamAnthropicOptions, state: StreamState): Promise<void> {
   const messageId = await saveAssistantMessage(options.env.DB, {
+    replyVariant: options.replyVariant,
     conversationId: options.conversationId,
     namespace: options.profile.namespace,
     source: options.profile.source,
@@ -198,9 +201,13 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
         await writer.write(openAIChunk({ content: trailing }));
       }
 
+      if (options.replyVariant) {
+        if (!state.finishReason) throw new Error("Upstream stream ended without a finish reason");
+        await persistStreamResult(options, state);
+      }
       await writer.write(doneChunk());
       await writer.close();
-      options.ctx.waitUntil(
+      if (!options.replyVariant) options.ctx.waitUntil(
         persistStreamResult(options, state).catch((error) => {
           console.error("failed to persist anthropic stream result", error);
         })

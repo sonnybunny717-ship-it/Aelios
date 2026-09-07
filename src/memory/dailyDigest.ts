@@ -800,6 +800,9 @@ export async function runDailyMemoryDigest(
 
   const rawSummaryContent = formatDailySummary(digest, dateLabel, messages);
   const summaryContent = await repairDailySummaryPerspective(env, rawSummaryContent);
+  if ((await getMessagesByIds(env.DB, { namespace, ids: messageIds })).length !== messageIds.length) {
+    return { ran: false, mode: "dream", reason: "messages_deleted_during_run", date: dateLabel, startIso, endIso, cursor };
+  }
 
   if (summaryContent) {
     await upsertSummary(env.DB, {

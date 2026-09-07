@@ -1,4 +1,5 @@
 import { callOpenAICompat } from "../proxy/openaiAdapter";
+import { getMessagesByIds } from "../db/messages";
 import {
   countMessagesAfter,
   getLatestSummary,
@@ -245,6 +246,8 @@ export async function maybeUpdateLongTermSummary(
       : sanitized.slice(0, SUMMARY_MAX_CHARS - 3) + "...";
 
   const lastMessage = messages[messages.length - 1];
+  const selected = await getMessagesByIds(env.DB, { namespace, ids: messages.map(message => message.id) });
+  if (selected.length !== messages.length) return { updated: false };
 
   await upsertSummary(env.DB, {
     namespace,

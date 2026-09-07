@@ -5,6 +5,7 @@ import {
 } from "../db/conversations";
 import { listMemories } from "../db/memories";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
+import { parseReplyVariant } from "../db/replyVariants";
 import { getLatestSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
 import { extractLastUserText, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
@@ -177,7 +178,11 @@ export async function handleChatCompletions(
     id: requestConversationId(body, auth.profile.namespace)
   });
 
+  let replyVariant;
+  try { replyVariant = parseReplyVariant((body as unknown as Record<string, unknown>).aelios_reply_variant); }
+  catch { return openAiError("Invalid reply variant", 400); }
   const savedUserMessageIds = await saveUserMessages(env.DB, {
+    replyVariant,
     conversationId: conversation.id,
     namespace: auth.profile.namespace,
     source: auth.profile.source,
@@ -283,6 +288,7 @@ export async function handleChatCompletions(
   if (body.stream) {
     if (provider === "anthropic") {
       return streamAnthropicToOpenAI(upstream, {
+        replyVariant,
         env,
         ctx,
         profile: auth.profile,
@@ -298,6 +304,7 @@ export async function handleChatCompletions(
     }
 
     return streamOpenAIWithTee(upstream, {
+      replyVariant,
       env,
       ctx,
       profile: auth.profile,
@@ -335,6 +342,7 @@ export async function handleChatCompletions(
       parsed.openai.choices[0].message.content = filteredContent;
     }
     const assistantMessageId = await saveAssistantMessage(env.DB, {
+      replyVariant,
       conversationId: conversation.id,
       namespace: auth.profile.namespace,
       source: auth.profile.source,
@@ -399,6 +407,7 @@ export async function handleChatCompletions(
     parsed.choices[0].message.content = filteredContent;
   }
   const assistantMessageId = await saveAssistantMessage(env.DB, {
+    replyVariant,
     conversationId: conversation.id,
     namespace: auth.profile.namespace,
     source: auth.profile.source,

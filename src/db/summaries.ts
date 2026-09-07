@@ -120,7 +120,7 @@ export async function countMessagesAfter(
     const row = await db
       .prepare(
         `SELECT COUNT(*) as cnt FROM messages
-         WHERE namespace = ? AND role IN ('user', 'assistant')`
+         WHERE namespace = ? AND memory_active = 1 AND role IN ('user', 'assistant')`
       )
       .bind(namespace)
       .first<{ cnt: number }>();
@@ -130,7 +130,7 @@ export async function countMessagesAfter(
   const row = await db
     .prepare(
       `SELECT COUNT(*) as cnt FROM messages
-       WHERE namespace = ? AND role IN ('user', 'assistant') AND created_at > ?`
+       WHERE namespace = ? AND memory_active = 1 AND role IN ('user', 'assistant') AND created_at > ?`
     )
     .bind(namespace, afterCreatedAt)
     .first<{ cnt: number }>();
@@ -168,7 +168,7 @@ export async function listRecentMessagesForSummary(
     .prepare(
       `SELECT id, conversation_id, namespace, role, content, source, created_at
        FROM messages
-       WHERE namespace = ? AND role IN ('user', 'assistant')
+       WHERE namespace = ? AND memory_active = 1 AND role IN ('user', 'assistant')
        ORDER BY created_at DESC
        LIMIT ?`
     )
