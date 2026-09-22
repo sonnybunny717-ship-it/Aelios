@@ -16,7 +16,7 @@ import type {
 const MAX_COMPACTION_MESSAGES = 60;
 const MAX_COMPACTION_INPUT_CHARS = 80_000;
 const WINDOW_SUMMARY_MAX_CHARS = 1_200;
-const LONG_TERM_STATE_MAX_CHARS = 700;
+const LONG_TERM_STATE_MAX_CHARS = 900;
 
 interface ContextCompactionMessage {
   role: "user" | "assistant";
@@ -88,7 +88,7 @@ export function buildConversationStateSummary(
 ): SummaryEntry | null {
   const parts: string[] = [];
   if (longTermSummary?.trim()) {
-    parts.push(`[长期背景]\n${truncate(longTermSummary, LONG_TERM_STATE_MAX_CHARS)}`);
+    parts.push(`[每日交接]\n${truncate(longTermSummary, LONG_TERM_STATE_MAX_CHARS)}`);
   }
   if (windowSummary?.trim()) {
     parts.push(`[此前窗口]\n${truncate(windowSummary, WINDOW_SUMMARY_MAX_CHARS)}`);
@@ -156,7 +156,7 @@ async function summarizeCompaction(
       { role: "user", content: buildWindowSummaryPrompt(previousSummary, messages) },
     ],
     temperature: 0,
-    max_tokens: 900,
+    max_tokens: 8192,
     stream: false,
   };
   const response = await callOpenAICompat(env, request);

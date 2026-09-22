@@ -39,6 +39,7 @@ import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from
 import { openAiError } from "../utils/json";
 import { hasImageContent } from "../utils/messages";
 import { addCloudflareCost } from "../billing/cloudflare";
+import { callRelayChat, readRelayTarget, type RelayTarget } from "./relay";
 import {
   prepareConversationContext,
   type PreparedConversationContext,
@@ -155,21 +156,34 @@ export async function handleChatCompletions(
     return openAiError("messages must be an array", 400);
   }
 
+  let relayTarget: RelayTarget | null;
+  try {
+    relayTarget = readRelayTarget(request);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid relay target";
+    return openAiError(message, 400);
+  }
+
+  const usesVisionOverride = hasImageContent(body) && body.vision_mode !== "current";
   let targetModel: string;
   try {
-    targetModel = resolveTargetModel(body.model, auth.profile, env);
+    targetModel = relayTarget && !usesVisionOverride
+      ? String(body.model || "").trim()
+      : resolveTargetModel(body.model, auth.profile, env);
+    if (!targetModel) throw new Error("Model is required");
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to resolve target model";
     return openAiError(message, 500);
   }
 
-  if (hasImageContent(body)) {
+  if (usesVisionOverride) {
     if (!env.VISION_MODEL) return openAiError("Missing VISION_MODEL", 500);
     targetModel = env.VISION_MODEL;
+    relayTarget = null;
   }
 
-  const provider = classifyProvider(targetModel);
-  const openRouterAnthropic = isOpenRouterAnthropicModel(targetModel);
+  const provider = relayTarget ? "openai-compatible" : classifyProvider(targetModel);
+  const openRouterAnthropic = !relayTarget && isOpenRouterAnthropicModel(targetModel);
   const openRouterCacheMode = openRouterAnthropic ? getOpenRouterAnthropicCacheMode(env) : null;
   const openRouterCacheTtl = openRouterCacheMode ? getOpenRouterAnthropicCacheTtl(env, targetModel) : null;
 
@@ -196,7 +210,8 @@ export async function handleChatCompletions(
 
   const memories = await selectMemoriesForInjection(env, {
     profile: auth.profile,
-    query: extractLastUserText(body.messages)
+    query: extractLastUserText(body.messages),
+    messages: body.messages
   });
 
   const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env.DB, auth.profile.namespace);
@@ -241,9 +256,6 @@ export async function handleChatCompletions(
         clientSystemHash = assembled.meta.client_system_hash;
         cacheAnchorBlock = assembled.meta.anchor_index >= 0 ? "client_system" : null;
         cacheDiagnosticsJson = buildCacheDiagnostics(conversation.id, assembled, conversationContext);
-        // NOTE: Anthropic adapter stringifies structured content (image_url etc.)
-        // as a temporary fallback; native Anthropic image support will be added
-        // when the vision pipeline is wired in.
         upstream = await callAnthropicNative(env, buildAnthropicRequestFromAssembled(body, targetModel, assembled, env), targetModel);
       }
     } else {
@@ -251,7 +263,9 @@ export async function handleChatCompletions(
         // Tool messages / tool_calls not yet supported by assembler — fall back
         const patchedBody = injectMemoryPatchAsSystemMessage(body, memories);
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel, env);
-        upstream = await callOpenAICompat(env, upstreamRequest);
+        upstream = relayTarget
+          ? await callRelayChat(relayTarget, upstreamRequest)
+          : await callOpenAICompat(env, upstreamRequest);
       } else {
         const assembled = assemble({
           request: body,
@@ -265,7 +279,15 @@ export async function handleChatCompletions(
         if (openRouterAnthropic) {
           cacheDiagnosticsJson = buildCacheDiagnostics(conversation.id, assembled, conversationContext);
         }
-        upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled, env));
+        const upstreamRequest = buildOpenAIRequestFromAssembled(
+          body,
+          targetModel,
+          assembled,
+          relayTarget ? undefined : env,
+        );
+        upstream = relayTarget
+          ? await callRelayChat(relayTarget, upstreamRequest)
+          : await callOpenAICompat(env, upstreamRequest);
       }
     }
   } catch (error) {
@@ -347,6 +369,7 @@ export async function handleChatCompletions(
       namespace: auth.profile.namespace,
       source: auth.profile.source,
       content: filteredContent,
+      reasoningContent: parsed.openai.choices?.[0]?.message?.reasoning_content ?? null,
       requestModel: body.model,
       upstreamModel: targetModel,
       provider,
@@ -412,6 +435,7 @@ export async function handleChatCompletions(
     namespace: auth.profile.namespace,
     source: auth.profile.source,
     content: filteredContent,
+    reasoningContent: parsed.choices?.[0]?.message?.reasoning_content ?? null,
     requestModel: body.model,
     upstreamModel: targetModel,
     provider,

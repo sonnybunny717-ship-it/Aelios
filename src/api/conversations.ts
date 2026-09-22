@@ -279,6 +279,9 @@ export async function handleDeleteConversation(request: Request, env: Env): Prom
 
   statements.push(
     env.DB
+      .prepare("DELETE FROM reply_edit_archives WHERE conversation_id = ? AND namespace = ?")
+      .bind(conversationId, auth.profile.namespace),
+    env.DB
       .prepare("DELETE FROM reply_selections WHERE conversation_id = ? AND namespace = ?")
       .bind(conversationId, auth.profile.namespace),
     env.DB

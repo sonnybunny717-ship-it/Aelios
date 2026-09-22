@@ -72,6 +72,7 @@ export async function saveAssistantMessage(
     namespace: string;
     source: string;
     content: string;
+    reasoningContent?: string | null;
     requestModel: string;
     upstreamModel: string;
     provider: string;
@@ -89,12 +90,12 @@ export async function saveAssistantMessage(
   await db
     .prepare(
       `INSERT INTO messages (
-        id, conversation_id, namespace, role, content, source, upstream_model,
+        id, conversation_id, namespace, role, content, reasoning_content, source, upstream_model,
         upstream_provider, request_model, stream, finish_reason, token_input,
         token_output, cache_mode, cache_ttl, cache_hit, cache_read_tokens,
         cache_creation_tokens, raw_usage_json, created_at,
         client_turn_id, client_variant_id, memory_active
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -102,6 +103,7 @@ export async function saveAssistantMessage(
       input.namespace,
       "assistant",
       input.content,
+      input.reasoningContent ?? null,
       input.source,
       input.upstreamModel,
       input.provider,

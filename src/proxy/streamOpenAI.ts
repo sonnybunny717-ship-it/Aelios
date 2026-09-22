@@ -11,6 +11,7 @@ import {
 import type { Env, KeyProfile, TokenUsage } from "../types";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
 import { normalizeOpenAIUsage } from "./openaiAdapter";
+import { createThinkingStreamParser } from "./thinkingStreamParser";
 
 interface StreamOpenAIOptions {
   replyVariant?: ReplyVariant;
@@ -31,9 +32,19 @@ interface StreamOpenAIOptions {
 
 interface StreamState {
   assistantText: string;
+  reasoningText: string;
   finishReason: string | null;
+  resultPersisted: boolean;
   usage?: TokenUsage;
   thinkingFilter: ThinkingFilterState;
+  thinkingParser: ReturnType<typeof createThinkingStreamParser>;
+}
+
+function appendPersistedDelta(state: StreamState, reasoning: string, content: string): void {
+  const fromReasoning = state.thinkingParser.pushThinking(reasoning);
+  const fromContent = state.thinkingParser.pushText(content);
+  state.assistantText += fromReasoning.textDelta + fromContent.textDelta;
+  state.reasoningText += fromReasoning.thinkingDelta + fromContent.thinkingDelta;
 }
 
 /**
@@ -58,7 +69,7 @@ function filterOpenAISSEData(
     const trailing = flushStreamFilter(state.thinkingFilter);
     if (!trailing) return new TextEncoder().encode("data: [DONE]\n\n");
 
-    state.assistantText += trailing;
+    appendPersistedDelta(state, "", trailing);
     const trailingChunk = {
       choices: [{ index: 0, delta: { content: trailing }, finish_reason: null }]
     };
@@ -85,20 +96,23 @@ function filterOpenAISSEData(
     if (choice?.finish_reason) state.finishReason = choice.finish_reason;
     if (parsed.usage) state.usage = normalizeOpenAIUsage(parsed.usage);
 
-    const hasReasoning = Boolean(choice?.delta?.reasoning_content);
+    const reasoningContent = choice?.delta?.reasoning_content || "";
+    const hasReasoning = Boolean(reasoningContent);
     const hasContent = Boolean(choice?.delta?.content);
+    let filteredContent = "";
 
     // Filter content if present.
     if (hasContent && choice?.delta) {
       const filtered = processStreamChunk(choice.delta.content!, state.thinkingFilter);
       if (filtered) {
         choice.delta.content = filtered;
-        state.assistantText += filtered;
+        filteredContent = filtered;
       } else {
         // Content fully consumed by <thinking>. Remove it from delta.
         delete choice.delta.content;
       }
     }
+    appendPersistedDelta(state, reasoningContent, filteredContent);
 
     // If the delta still has something to send (reasoning or filtered content), emit it.
     if (hasReasoning || choice?.delta?.content) {
@@ -125,6 +139,7 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
     namespace: options.profile.namespace,
     source: options.profile.source,
     content: state.assistantText,
+    reasoningContent: state.reasoningText,
     requestModel: options.requestModel,
     upstreamModel: options.upstreamModel,
     provider: options.provider,
@@ -134,6 +149,7 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
     cacheMode: options.cacheMode ?? null,
     cacheTtl: options.cacheTtl ?? null
   });
+  state.resultPersisted = true;
 
   await saveUsageLog(options.env.DB, {
     messageId,
@@ -173,8 +189,11 @@ export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOpt
   const decoder = new TextDecoder();
   const state: StreamState = {
     assistantText: "",
+    reasoningText: "",
     finishReason: null,
-    thinkingFilter: createThinkingFilterState()
+    resultPersisted: false,
+    thinkingFilter: createThinkingFilterState(),
+    thinkingParser: createThinkingStreamParser()
   };
 
   void (async () => {
@@ -214,12 +233,16 @@ export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOpt
       // Flush held trailing dash or unclosed <think> text at stream end.
       const trailing = flushStreamFilter(state.thinkingFilter);
       if (trailing) {
-        state.assistantText += trailing;
+        appendPersistedDelta(state, "", trailing);
         const trailingChunk = {
           choices: [{ index: 0, delta: { content: trailing }, finish_reason: null }]
         };
         await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(trailingChunk)}\n\n`));
       }
+
+      const trailingRoute = state.thinkingParser.finish();
+      state.assistantText += trailingRoute.textDelta;
+      state.reasoningText += trailingRoute.thinkingDelta;
 
       if (options.replyVariant) {
         if (!state.finishReason) throw new Error("Upstream stream ended without a finish reason");
@@ -233,6 +256,18 @@ export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOpt
         })
       );
     } catch (error) {
+      const trailingRoute = state.thinkingParser.finish();
+      state.assistantText += trailingRoute.textDelta;
+      state.reasoningText += trailingRoute.thinkingDelta;
+      if (options.replyVariant && !state.resultPersisted
+          && (state.assistantText.trim() || state.reasoningText.trim())) {
+        state.finishReason ||= "interrupted";
+        try {
+          await persistStreamResult(options, state);
+        } catch (persistError) {
+          console.error("failed to persist interrupted stream result", persistError);
+        }
+      }
       console.error("openai stream proxy error", error);
       await writer.abort(error);
     } finally {

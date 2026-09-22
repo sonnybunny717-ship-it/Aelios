@@ -31,6 +31,7 @@ interface StreamState {
   assistantText: string;
   reasoningText: string;
   finishReason: string | null;
+  resultPersisted: boolean;
   usage?: TokenUsage;
   thinkingFilter: ThinkingFilterState;
 }
@@ -111,6 +112,7 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
     namespace: options.profile.namespace,
     source: options.profile.source,
     content: state.assistantText,
+    reasoningContent: state.reasoningText,
     requestModel: options.requestModel,
     upstreamModel: options.upstreamModel,
     provider: options.provider,
@@ -120,6 +122,7 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
     cacheMode: getAnthropicCacheMode(options.env),
     cacheTtl: getAnthropicCacheTtl(options.env, options.upstreamModel)
   });
+  state.resultPersisted = true;
 
   await saveUsageLog(options.env.DB, {
     messageId,
@@ -161,6 +164,7 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
     assistantText: "",
     reasoningText: "",
     finishReason: null,
+    resultPersisted: false,
     thinkingFilter: createThinkingFilterState()
   };
 
@@ -213,6 +217,15 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
         })
       );
     } catch (error) {
+      if (options.replyVariant && !state.resultPersisted
+          && (state.assistantText.trim() || state.reasoningText.trim())) {
+        state.finishReason ||= "interrupted";
+        try {
+          await persistStreamResult(options, state);
+        } catch (persistError) {
+          console.error("failed to persist interrupted anthropic stream result", persistError);
+        }
+      }
       console.error("anthropic stream proxy error", error);
       await writer.abort(error);
     } finally {

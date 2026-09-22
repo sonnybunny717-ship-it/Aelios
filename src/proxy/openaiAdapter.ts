@@ -17,6 +17,7 @@ function stripClaudeNativeThinkingFields(req: OpenAIChatRequest): OpenAIChatRequ
   delete cleaned.post_user_instructions;
   delete cleaned.context_epoch;
   delete cleaned.context_compaction;
+  delete cleaned.vision_mode;
   return cleaned;
 }
 

@@ -25,6 +25,47 @@ export function extractLastUserText(messages: OpenAIChatMessage[]): string {
   return "";
 }
 
+const RECALL_CONTEXT_MESSAGE_CHARS = 700;
+
+function recallContextText(content: OpenAIChatMessage["content"]): string {
+  const text = contentToText(content).trim();
+  if (text.length <= RECALL_CONTEXT_MESSAGE_CHARS) return text;
+  return text.slice(-RECALL_CONTEXT_MESSAGE_CHARS);
+}
+
+/**
+ * Build a fallback search query from the current message and the immediately
+ * preceding user/assistant exchange. This query is used only when the normal
+ * current-message retrieval produces no usable memories.
+ */
+export function buildContextualMemoryQuery(
+  messages: OpenAIChatMessage[],
+  currentQuery: string
+): string | null {
+  const current = currentQuery.trim();
+  if (!current) return null;
+
+  let currentUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      currentUserIndex = index;
+      break;
+    }
+  }
+  if (currentUserIndex <= 0) return null;
+
+  const previous: string[] = [];
+  for (let index = currentUserIndex - 1; index >= 0 && previous.length < 2; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const text = recallContextText(message.content);
+    if (text) previous.unshift(text);
+  }
+  if (previous.length === 0) return null;
+
+  return [...previous, current].join("\n\n");
+}
+
 function resolveInjectionMode(profile: KeyProfile, env: Env): InjectionMode {
   const mode = env.INJECTION_MODE || profile.injectionMode;
   if (mode === "full" || mode === "hybrid" || mode === "none") return mode;
@@ -114,12 +155,13 @@ function sanitizeMemoryContent(text: string): string {
 
 export async function selectMemoriesForInjection(
   env: Env,
-  input: { profile: KeyProfile; query: string }
+  input: { profile: KeyProfile; query: string; messages?: OpenAIChatMessage[] }
 ): Promise<MemoryApiRecord[]> {
   const mode = resolveInjectionMode(input.profile, env);
   if (mode === "none") return [];
 
   const namespace = input.profile.namespace;
+  const contextualQuery = buildContextualMemoryQuery(input.messages ?? [], input.query);
 
   if (mode === "full") {
     const memories = await listMemoriesForInjection(env, {
@@ -127,8 +169,13 @@ export async function selectMemoriesForInjection(
       limit: 500
     });
 
-    return filterAndCompressMemories(env, {
+    const primary = await filterAndCompressMemories(env, {
       query: input.query,
+      memories
+    });
+    if (primary.length > 0 || !contextualQuery) return primary;
+    return filterAndCompressMemories(env, {
+      query: contextualQuery,
       memories
     });
   }
@@ -142,9 +189,20 @@ export async function selectMemoriesForInjection(
     : [];
 
   if (mode === "rag") {
-    return filterAndCompressMemories(env, {
+    const primary = await filterAndCompressMemories(env, {
       query: input.query,
       memories: ragMemories
+    });
+    if (primary.length > 0 || !contextualQuery) return primary;
+
+    const contextualMemories = await searchMemoriesForInjection(env, {
+      namespace,
+      query: contextualQuery,
+      topK: getTopK(env)
+    });
+    return filterAndCompressMemories(env, {
+      query: contextualQuery,
+      memories: contextualMemories
     });
   }
 
@@ -154,9 +212,20 @@ export async function selectMemoriesForInjection(
   });
   const pinned = records.filter((record) => record.pinned);
 
-  return filterAndCompressMemories(env, {
+  const primary = await filterAndCompressMemories(env, {
     query: input.query,
     memories: dedupeMemories([...pinned, ...ragMemories])
+  });
+  if (primary.length > 0 || !contextualQuery) return primary;
+
+  const contextualMemories = await searchMemoriesForInjection(env, {
+    namespace,
+    query: contextualQuery,
+    topK: getTopK(env)
+  });
+  return filterAndCompressMemories(env, {
+    query: contextualQuery,
+    memories: dedupeMemories([...pinned, ...contextualMemories])
   });
 }
 
@@ -168,7 +237,9 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
     if (!content) return [];
     const importance = memory.importance.toFixed(2);
     const pinned = memory.pinned ? "[pinned]" : "";
-    return [`- [${memory.type}][importance=${importance}]${pinned} ${content}`];
+    const sourceMessageIds = memory.source_message_ids.filter((id) => /^\d+$/.test(id));
+    const source = sourceMessageIds.length > 0 ? ` [source=${sourceMessageIds.join(",")}]` : "";
+    return [`- [${memory.type}][importance=${importance}]${pinned} ${content}${source}`];
   });
 
   if (lines.length === 0) return "";

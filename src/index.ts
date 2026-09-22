@@ -10,6 +10,8 @@ import { handleModels } from "./api/models";
 import { handleBillingBalances } from "./api/billing";
 import { handleDeleteConversation } from "./api/conversations";
 import { handleReplySelection } from "./api/replySelection";
+import { handleRelayModels } from "./api/relay";
+import { handleSourceMessageSync } from "./api/sourceMessages";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
 import { runMemoryRetention } from "./memory/retention";
 import { handleQueueMessage } from "./queue/consumer";
@@ -26,12 +28,16 @@ function getDailyDigestMaxRuns(env: Env): number {
   return Math.min(Math.max(Math.floor(parsed), 1), 10);
 }
 
-async function runDailyMemoryDigestBatches(env: Env, namespace: string): Promise<unknown[]> {
+async function runDailyMemoryDigestBatches(
+  env: Env,
+  namespace: string,
+  executionTime: string
+): Promise<unknown[]> {
   const results: unknown[] = [];
   const maxRuns = getDailyDigestMaxRuns(env);
 
   for (let i = 0; i < maxRuns; i += 1) {
-    const result = await runDailyMemoryDigest(env, namespace);
+    const result = await runDailyMemoryDigest(env, namespace, { executionTime });
     results.push(result);
     if (!result.ran || !result.stats?.hasMore) break;
   }
@@ -53,6 +59,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       return handleModels(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/relay/models") {
+      return handleRelayModels(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/v1/billing/balances") {
@@ -84,6 +94,10 @@ export default {
 
     if (url.pathname.startsWith("/v1/memories")) {
       return handleMemories(request, env, ctx);
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/memory/source-messages/sync") {
+      return handleSourceMessageSync(request, env);
     }
 
     if (url.pathname === "/v1/memory" || url.pathname.startsWith("/v1/memory/")) {
@@ -134,9 +148,10 @@ export default {
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const namespace = getDailyDigestNamespace(env);
+    const executionTime = new Date().toISOString();
     ctx.waitUntil(
       Promise.all([
-        runDailyMemoryDigestBatches(env, namespace),
+        runDailyMemoryDigestBatches(env, namespace, executionTime),
         runMemoryRetention(env, namespace)
       ]).then(([digest, retention]) => {
         console.log("scheduled daily memory maintenance", { namespace, digest, retention });

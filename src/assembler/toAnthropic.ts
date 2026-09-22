@@ -23,9 +23,22 @@ export interface AnthropicTextBlock {
   };
 }
 
+export interface AnthropicImageBlock {
+  type: "image";
+  source:
+    | { type: "url"; url: string }
+    | { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string };
+  cache_control?: {
+    type: "ephemeral";
+    ttl?: "5m" | "1h";
+  };
+}
+
+export type AnthropicContentBlock = AnthropicTextBlock | AnthropicImageBlock;
+
 export interface AnthropicWireMessage {
   role: "user" | "assistant";
-  content: AnthropicTextBlock[];
+  content: AnthropicContentBlock[];
 }
 
 // ---------------------------------------------------------------------------
@@ -58,11 +71,8 @@ export function assembledToAnthropicSystem(
 /**
  * Convert AssembledPrompt.messages to Anthropic message format.
  *
- * Anthropic expects content as AnthropicTextBlock[].
- * For string content: direct text block.
- * For structured content (image_url etc.): stringify as fallback,
- * since Anthropic text blocks cannot represent image_url natively.
- * For null content: empty text block.
+ * Converts OpenAI text/image_url blocks to Anthropic text/image blocks.
+ * Unknown structured blocks are preserved as JSON text instead of being dropped.
  */
 export function assembledToAnthropicMessages(
   messages: AssembledPrompt["messages"]
@@ -71,24 +81,15 @@ export function assembledToAnthropicMessages(
 
   for (const msg of messages) {
     const role = msg.role;
-    const text = contentToPlainText(msg.content);
+    const blocks = openAIContentToAnthropicBlocks(msg.content);
 
     const prev = result[result.length - 1];
     if (prev?.role === role) {
-      if (role === "assistant") {
-        const lastBlock = prev.content[prev.content.length - 1];
-        if (lastBlock.text && text) {
-          lastBlock.text = `${lastBlock.text}\n\n${text}`;
-        } else if (text) {
-          lastBlock.text = text;
-        }
-      } else {
-        prev.content.push({ type: "text", text });
-      }
+      prev.content.push(...blocks);
       continue;
     }
 
-    result.push({ role, content: [{ type: "text", text }] });
+    result.push({ role, content: blocks });
   }
 
   if (result.length === 0) {
@@ -102,9 +103,60 @@ export function assembledToAnthropicMessages(
 // Helper
 // ---------------------------------------------------------------------------
 
-function contentToPlainText(content: string | unknown[] | null): string {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-  // Structured content (image_url etc.) — stringify as fallback for Anthropic
-  return JSON.stringify(content);
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function imageBlockFromUrl(url: string): AnthropicImageBlock | null {
+  const dataMatch = url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,([\s\S]+)$/i);
+  if (dataMatch) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: dataMatch[1].toLowerCase() as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+        data: dataMatch[2],
+      },
+    };
+  }
+  if (/^https?:\/\//i.test(url)) {
+    return { type: "image", source: { type: "url", url } };
+  }
+  return null;
+}
+
+export function openAIContentToAnthropicBlocks(
+  content: string | unknown[] | null
+): AnthropicContentBlock[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (content == null) return [{ type: "text", text: "" }];
+
+  const blocks: AnthropicContentBlock[] = [];
+  for (const part of content) {
+    if (!isRecord(part)) {
+      blocks.push({ type: "text", text: JSON.stringify(part) });
+      continue;
+    }
+    if (part.type === "text" && typeof part.text === "string") {
+      blocks.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image_url" || part.type === "input_image") {
+      const rawImage = part.image_url;
+      const url = typeof rawImage === "string"
+        ? rawImage
+        : isRecord(rawImage) && typeof rawImage.url === "string"
+          ? rawImage.url
+          : typeof part.url === "string"
+            ? part.url
+            : "";
+      const image = imageBlockFromUrl(url);
+      if (image) {
+        blocks.push(image);
+        continue;
+      }
+    }
+    blocks.push({ type: "text", text: JSON.stringify(part) });
+  }
+  return blocks.length ? blocks : [{ type: "text", text: "" }];
 }

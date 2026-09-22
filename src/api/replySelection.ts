@@ -6,6 +6,144 @@ import { newId } from "../utils/ids";
 import type { Env } from "../types";
 import { json, openAiError } from "../utils/json";
 
+const ARCHIVE_ID = /^[a-zA-Z0-9_-]{1,100}$/;
+
+function editArchiveId(value: unknown): string | null {
+  return typeof value === "string" && ARCHIVE_ID.test(value) ? value : null;
+}
+
+function discardedTurnIds(value: unknown, sourceTurnId: string): string[] | null {
+  if (!Array.isArray(value) || value.length > 1000) return null;
+  const ids = [...new Set(value)];
+  return ids.every(id => typeof id === "string" && ARCHIVE_ID.test(id) && id !== sourceTurnId)
+    ? ids as string[]
+    : null;
+}
+
+async function persistMissingAssistantCandidate(
+  body: Record<string, unknown>,
+  env: Env,
+  namespace: string,
+  conversationId: string,
+  turnId: string,
+  variantId: string,
+): Promise<boolean> {
+  if (typeof body.assistantContent !== "string") return false;
+  const assistantContent = body.assistantContent;
+  const assistantReasoning = typeof body.assistantReasoning === "string" ? body.assistantReasoning : "";
+  if (!assistantContent.trim() && !assistantReasoning.trim()) return false;
+  const finishReason = typeof body.deliveryStatus === "string" && body.deliveryStatus
+    ? body.deliveryStatus
+    : null;
+  const inserted = await env.DB.prepare(`INSERT INTO messages (
+      id, conversation_id, namespace, role, content, reasoning_content, source,
+      upstream_model, upstream_provider, request_model, stream, finish_reason,
+      created_at, client_turn_id, client_variant_id, memory_active
+    ) SELECT ?, candidate.conversation_id, candidate.namespace, 'assistant', ?, ?, candidate.source,
+      candidate.upstream_model, candidate.upstream_provider, candidate.request_model, candidate.stream, ?,
+      ?, candidate.client_turn_id, candidate.client_variant_id, 0
+    FROM messages candidate
+    WHERE candidate.namespace = ? AND candidate.conversation_id = ?
+      AND candidate.client_turn_id = ? AND candidate.client_variant_id = ? AND candidate.role = 'user'
+      AND NOT EXISTS (SELECT 1 FROM messages existing
+        WHERE existing.namespace = candidate.namespace
+          AND existing.conversation_id = candidate.conversation_id
+          AND existing.client_turn_id = candidate.client_turn_id
+          AND existing.client_variant_id = candidate.client_variant_id
+          AND existing.role = 'assistant')
+    ORDER BY candidate.created_at DESC LIMIT 1`)
+    .bind(
+      newId("msg"), assistantContent, assistantReasoning || null, finishReason,
+      new Date().toISOString(), namespace, conversationId, turnId, variantId,
+    ).run();
+  if (inserted.meta.changes === 1) return true;
+  const existing = await env.DB.prepare(`SELECT id FROM messages
+    WHERE namespace = ? AND conversation_id = ? AND client_turn_id = ?
+      AND client_variant_id = ? AND role = 'assistant' LIMIT 1`)
+    .bind(namespace, conversationId, turnId, variantId).first<{ id: string }>();
+  return Boolean(existing);
+}
+
+async function applyArchivedEdit(
+  env: Env,
+  namespace: string,
+  conversationId: string,
+  sourceTurnId: string,
+  discardedTurns: string[],
+): Promise<void> {
+  const turnIds = [sourceTurnId, ...discardedTurns];
+  const obsolete: Array<{ id: string; created_at: string }> = [];
+  for (const turnId of turnIds) {
+    const rows = await env.DB.prepare(`SELECT id, created_at FROM messages
+      WHERE namespace = ? AND conversation_id = ? AND client_turn_id = ?`)
+      .bind(namespace, conversationId, turnId).all<{ id: string; created_at: string }>();
+    obsolete.push(...(rows.results ?? []));
+  }
+  const statements = await invalidateMessageDerivatives(env, namespace, conversationId, obsolete);
+  for (const turnId of turnIds) {
+    statements.push(
+      env.DB.prepare(`DELETE FROM usage_logs WHERE namespace = ? AND message_id IN (
+        SELECT id FROM messages WHERE namespace = ? AND conversation_id = ? AND client_turn_id = ?)`)
+        .bind(namespace, namespace, conversationId, turnId),
+      env.DB.prepare(`DELETE FROM messages WHERE namespace = ? AND conversation_id = ? AND client_turn_id = ?`)
+        .bind(namespace, conversationId, turnId),
+      env.DB.prepare(`DELETE FROM reply_selections WHERE namespace = ? AND conversation_id = ? AND turn_id = ?`)
+        .bind(namespace, conversationId, turnId),
+    );
+  }
+  await env.DB.batch(statements);
+}
+
+async function handleEditArchiveAction(
+  body: Record<string, unknown>,
+  env: Env,
+  namespace: string,
+  conversationId: string,
+): Promise<Response | null> {
+  const action = String(body.action || "");
+  if (!['archive_edit', 'update_edit_draft', 'delete_edit_archive'].includes(action)) return null;
+  const archiveId = editArchiveId(body.archiveId);
+  if (!archiveId) return openAiError("Invalid edit archive", 400);
+
+  if (action === 'delete_edit_archive' || action === 'update_edit_draft') {
+    return json({ ok: true, archiveId });
+  }
+
+  const draftContent = typeof body.draftContent === 'string' ? body.draftContent.trim() : '';
+  if (!draftContent) return openAiError("Invalid edited prompt", 400);
+
+  let variant;
+  try { variant = parseReplyVariant(body); }
+  catch { return openAiError("Invalid reply variant", 400); }
+  if (!variant) return openAiError("Missing reply variant", 400);
+  const revision = Number(body.revision);
+  if (!Number.isSafeInteger(revision) || revision < 1) return openAiError("Invalid revision", 400);
+  const discardedTurns = discardedTurnIds(body.discardedTurns ?? [], variant.turnId);
+  if (!discardedTurns) return openAiError("Invalid discarded turns", 400);
+
+  const current = await env.DB.prepare(`SELECT revision, variant_id FROM reply_selections
+    WHERE namespace = ? AND conversation_id = ? AND turn_id = ?`)
+    .bind(namespace, conversationId, variant.turnId)
+    .first<{ revision: number; variant_id: string }>();
+  if (!current) {
+    const remaining = await env.DB.prepare(`SELECT id FROM messages
+      WHERE namespace = ? AND conversation_id = ? AND client_turn_id = ? LIMIT 1`)
+      .bind(namespace, conversationId, variant.turnId).first<{ id: string }>();
+    if (!remaining) return json({ ok: true, archiveId });
+    return openAiError("Stale reply selection", 409);
+  }
+  if (current.revision !== revision || current.variant_id !== variant.variantId) {
+    return openAiError("Stale reply selection", 409);
+  }
+  const assistant = await env.DB.prepare(`SELECT id FROM messages
+    WHERE namespace = ? AND conversation_id = ? AND client_turn_id = ? AND role = 'assistant' LIMIT 1`)
+    .bind(namespace, conversationId, variant.turnId).first<{ id: string }>();
+  if (!assistant) return openAiError("Reply is not persisted yet", 409);
+
+  await applyArchivedEdit(env, namespace, conversationId, variant.turnId, discardedTurns);
+  return json({ ok: true, archiveId });
+}
+
 export async function handleReplySelection(request: Request, env: Env): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
@@ -15,10 +153,12 @@ export async function handleReplySelection(request: Request, env: Env): Promise<
   const rawId = new URL(request.url).pathname.slice("/v1/conversations/".length, -"/reply-selection".length);
   const conversationId = normalizeConversationId(rawId, namespace);
   if (!conversationId) return openAiError("Invalid conversation id", 400);
-  if (request.method === "GET") return json({ version: 1 });
+  if (request.method === "GET") return json({ version: 2, editArchives: true });
   let body: Record<string, unknown>;
   try { body = await request.json() as Record<string, unknown>; }
   catch { return openAiError("Invalid JSON", 400); }
+  const editArchiveResponse = await handleEditArchiveAction(body, env, namespace, conversationId);
+  if (editArchiveResponse) return editArchiveResponse;
   let variant;
   try { variant = parseReplyVariant(body); }
   catch { return openAiError("Invalid reply variant", 400); }
@@ -109,7 +249,12 @@ export async function handleReplySelection(request: Request, env: Env): Promise<
     return json({ ok: true, revision });
   }
   if (body.action !== "select") return openAiError("Invalid action", 400);
-  const exists = selectionReads?.[1].results[0];
+  let exists = selectionReads?.[1].results[0];
+  if (!exists && await persistMissingAssistantCandidate(
+    body, env, namespace, conversationId, turnId, variantId,
+  )) {
+    exists = { id: variantId };
+  }
   if (!exists && !(body.finalized === true && current?.variant_id === variantId)) return openAiError("Reply is not persisted yet", 409, "reply_not_persisted");
   const discardedTurns = Array.isArray(body.discardedTurns) ? body.discardedTurns : [];
   if (discardedTurns.length > 1000 || discardedTurns.some(id => typeof id !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(id) || id === turnId)) {

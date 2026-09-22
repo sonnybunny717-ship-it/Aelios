@@ -6,45 +6,53 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <title>Aelios Memory Admin</title>
 <style>
 :root {
-  --bg:#0d0e10; --panel:#15171b; --panel2:#1b1e24; --panel3:#22262d;
-  --line:#292d35; --line2:#3a3f49; --text:#e9eaec; --muted:#a8acb5; --faint:#737884;
-  --accent:#e0aa55; --accent2:rgba(224,170,85,.16); --good:#74c799; --bad:#e27663; --warn:#dfb85d; --info:#6ca8d9;
-  --radius:7px; --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+  --bg:#251a21; --panel:rgba(54,35,46,.88); --panel2:rgba(78,50,64,.78); --panel3:rgba(100,63,79,.72);
+  --line:rgba(245,208,220,.14); --line2:rgba(245,208,220,.3); --text:#fff8f2; --muted:#d9bdc6; --faint:#a98793;
+  --accent:#efa9bd; --accent2:rgba(239,169,189,.17); --good:#86cba5; --bad:#f08f82; --warn:#e3bf78; --info:#9fc3dd;
+  --radius:16px; --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
   color-scheme:dark;
 }
 [data-theme="light"] {
-  --bg:#f6f5f1; --panel:#fff; --panel2:#f1eee8; --panel3:#e6e2d9;
-  --line:#ded9ce; --line2:#c5beb1; --text:#17191d; --muted:#626872; --faint:#8d9199;
-  --accent:#b87924; --accent2:rgba(184,121,36,.12); --good:#2d9362; --bad:#c54332; --warn:#a87912; --info:#286fa5;
+  --bg:#fefaf6; --panel:rgba(255,255,255,.62); --panel2:rgba(252,232,239,.64); --panel3:rgba(245,208,220,.72);
+  --line:rgba(232,160,180,.2); --line2:rgba(212,137,158,.38); --text:#4a3f3f; --muted:#8a7a7a; --faint:#b8a8a8;
+  --accent:#d4899e; --accent2:rgba(232,160,180,.16); --good:#5fa37d; --bad:#c85e58; --warn:#b88b38; --info:#6ba3c2;
   color-scheme:light;
 }
-*{box-sizing:border-box} html,body{height:100%} body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}
+*{box-sizing:border-box} html,body{height:100%} body{margin:0;background:
+  radial-gradient(ellipse at 16% 18%,rgba(232,160,180,.22),transparent 42%),
+  radial-gradient(ellipse at 86% 14%,rgba(197,179,214,.16),transparent 38%),
+  linear-gradient(160deg,var(--bg),color-mix(in srgb,var(--bg),#f5d0dc 8%));color:var(--text);font:13px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.7;background:radial-gradient(2px 2px at 12% 22%,rgba(245,208,220,.34),transparent),radial-gradient(2px 2px at 72% 18%,rgba(197,179,214,.3),transparent),radial-gradient(3px 3px at 88% 72%,rgba(232,160,180,.24),transparent),radial-gradient(2px 2px at 36% 84%,rgba(201,169,110,.2),transparent)}
 button,input,textarea,select{font:inherit;color:inherit} button{cursor:pointer} .mono{font-family:var(--mono);font-size:12px}
 .app{height:100dvh;display:grid;grid-template-rows:48px 1fr}
-.top{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);backdrop-filter:blur(12px)}
-.brand{display:flex;align-items:center;gap:9px;min-width:138px}.mark{width:24px;height:24px;border-radius:6px;background:var(--accent);color:#111;display:grid;place-items:center;font-weight:800}.brand b{display:block;font-size:13px}.brand span{display:block;font:10px var(--mono);letter-spacing:.14em;color:var(--faint)}
-.tabs{display:flex;gap:5px}.tab{height:32px;border:1px solid transparent;background:transparent;color:var(--muted);border-radius:6px;padding:0 10px}.tab.active{background:var(--panel2);color:var(--text);border-color:var(--line)}
+.top{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);-webkit-backdrop-filter:blur(20px) saturate(125%);backdrop-filter:blur(20px) saturate(125%)}
+.brand{display:flex;align-items:center;gap:9px;min-width:138px}.mark{width:26px;height:26px;border-radius:9px;background:linear-gradient(145deg,#f5d0dc,var(--accent));color:#5b3d48;display:grid;place-items:center;font-family:Georgia,serif;font-weight:800;box-shadow:0 4px 16px rgba(212,137,158,.24),inset 0 1px 0 rgba(255,255,255,.58)}.brand b{display:block;font-family:Georgia,"Songti SC",serif;font-size:14px}.brand span{display:block;font:10px var(--mono);letter-spacing:.14em;color:var(--faint)}
+.tabs{display:flex;gap:5px}.tab{height:32px;border:1px solid transparent;background:transparent;color:var(--muted);border-radius:11px;padding:0 10px}.tab.active{background:var(--panel2);color:var(--text);border-color:var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
 .cred{display:flex;gap:8px;flex:1;min-width:0}.input{height:32px;border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:0 9px;outline:none;min-width:0}.input:focus,.textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent2)}.worker{flex:1}.key{width:260px}
-.btn{height:32px;border:1px solid var(--line);background:var(--panel2);border-radius:6px;padding:0 10px;display:inline-flex;align-items:center;gap:6px;justify-content:center;white-space:nowrap}.btn:hover{border-color:var(--line2)}.btn.primary{background:var(--accent);border-color:var(--accent);color:#111;font-weight:650}.btn.danger{background:rgba(226,118,99,.13);border-color:rgba(226,118,99,.45);color:var(--bad)}.btn.ghost{background:transparent}.btn:disabled{opacity:.55;cursor:not-allowed}
+.input{border-radius:11px;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
+.btn{height:32px;border:1px solid var(--line);background:var(--panel2);border-radius:11px;padding:0 10px;display:inline-flex;align-items:center;gap:6px;justify-content:center;white-space:nowrap;transition:border-color .2s,transform .16s,background .2s}.btn:hover{border-color:var(--line2)}.btn:active{transform:scale(.97)}.btn.primary{background:linear-gradient(145deg,#f5d0dc,var(--accent));border-color:rgba(212,137,158,.5);color:#553a44;font-weight:650}.btn.danger{background:rgba(226,118,99,.13);border-color:rgba(226,118,99,.45);color:var(--bad)}.btn.ghost{background:transparent}.btn:disabled{opacity:.55;cursor:not-allowed}
 .status{display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.dot{width:8px;height:8px;border-radius:999px;background:var(--faint)}.dot.good{background:var(--good)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
-.main{min-height:0;display:grid;grid-template-columns:280px minmax(360px,1fr) 420px;position:relative}.side,.list,.detail{min-height:0;overflow:auto;border-right:1px solid var(--line)}.detail{border-right:0}.side{background:var(--panel);padding:13px}.section{margin-bottom:18px}.section-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;color:var(--muted);font-size:12px}.label{font-size:11px;color:var(--muted);margin:0 0 5px}.searchbox{display:grid;gap:8px}.textarea{width:100%;border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:9px;resize:vertical;outline:none}
+.main{min-height:0;display:grid;grid-template-columns:280px minmax(360px,1fr) 420px;position:relative}.side,.list,.detail{min-height:0;overflow:auto;border-right:1px solid var(--line)}.detail{border-right:0}.side{background:var(--panel);padding:13px;-webkit-backdrop-filter:blur(18px) saturate(120%);backdrop-filter:blur(18px) saturate(120%)}.section{margin-bottom:18px}.section-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;color:var(--muted);font-size:12px}.label{font-size:11px;color:var(--muted);margin:0 0 5px}.searchbox{display:grid;gap:8px}.textarea{width:100%;border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:9px;resize:vertical;outline:none}
 .seg{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:6px;overflow:hidden}.seg button{height:30px;border:0;background:var(--panel2);color:var(--muted)}.seg button.active{background:var(--accent2);color:var(--accent)}
+.seg.sort-seg{grid-template-columns:repeat(2,1fr);border-radius:11px}.range-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.range-grid button{min-height:32px;border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--muted)}.range-grid button.active{border-color:var(--line2);background:var(--accent2);color:var(--accent);font-weight:600}.date-range-inputs{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.date-range-inputs .input{width:100%;font-family:var(--mono);font-size:11px}
 .checkgrid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.check{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}.check input{accent-color:var(--accent)}
 .hint{padding:10px;border:1px solid var(--line);background:var(--panel2);border-radius:6px;color:var(--muted);font-size:12px}
-.toolbar{height:48px;display:flex;align-items:center;gap:9px;padding:8px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:2}.toolbar h2{font-size:14px;margin:0}.meta{color:var(--faint);font-family:var(--mono);font-size:12px}.grow{flex:1}
-.cards{padding:10px}.card{border:1px solid var(--line);background:var(--panel);border-radius:7px;margin-bottom:8px;padding:10px;display:grid;gap:7px}.card.active{border-color:var(--accent);background:linear-gradient(0deg,var(--accent2),transparent 70%),var(--panel)}.card-top{display:flex;align-items:center;gap:7px}.type{font:11px var(--mono);padding:2px 6px;border-radius:4px;background:var(--accent2);color:var(--accent)}.source{font:11px var(--mono);color:var(--muted)}.date{margin-left:auto;color:var(--faint);font-size:12px}.content{white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.tags{display:flex;flex-wrap:wrap;gap:5px}.tag{font-size:11px;padding:2px 6px;border:1px solid var(--line);background:var(--panel2);border-radius:4px;color:var(--muted)}.scores{margin-left:auto;color:var(--muted);font:11px var(--mono)}
+.toolbar{height:48px;display:flex;align-items:center;gap:9px;padding:8px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:color-mix(in srgb,var(--bg),transparent 8%);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);z-index:2}.toolbar h2{font-family:Georgia,"Songti SC",serif;font-size:15px;margin:0}.meta{color:var(--faint);font-family:var(--mono);font-size:12px}.grow{flex:1}
+.cards{padding:10px}.card{border:1px solid var(--line);background:var(--panel);border-radius:15px;margin-bottom:9px;padding:11px;display:grid;gap:7px;box-shadow:0 8px 26px rgba(112,64,82,.06),inset 0 1px 0 rgba(255,255,255,.12);-webkit-backdrop-filter:blur(14px) saturate(115%);backdrop-filter:blur(14px) saturate(115%);transition:transform .2s,border-color .2s}.card:hover{transform:translateY(-1px);border-color:var(--line2)}.card.active{border-color:var(--accent);background:linear-gradient(0deg,var(--accent2),transparent 70%),var(--panel)}.card-top{display:flex;align-items:center;gap:7px}.type{font:11px var(--mono);padding:2px 7px;border-radius:8px;background:var(--accent2);color:var(--accent)}.source{font:11px var(--mono);color:var(--muted)}.date{margin-left:auto;color:var(--faint);font-size:12px}.content{white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.tags{display:flex;flex-wrap:wrap;gap:5px}.tag{font-size:11px;padding:2px 7px;border:1px solid var(--line);background:var(--panel2);border-radius:8px;color:var(--muted)}.scores{margin-left:auto;color:var(--muted);font:11px var(--mono)}
 .empty{height:100%;min-height:260px;display:grid;place-items:center;color:var(--muted);text-align:center;padding:24px}.empty b{display:block;color:var(--text);margin-bottom:5px}
 .detail-head{height:48px;display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:2}.detail-body{padding:14px;display:grid;gap:13px}.row{display:grid;grid-template-columns:110px 1fr;gap:9px;align-items:center;border-bottom:1px solid var(--line);padding:6px 0}.row label{font:11px var(--mono);color:var(--muted)}.field{display:grid;gap:5px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.slider{accent-color:var(--accent);width:100%}.actions{position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--line);padding:10px 14px;display:flex;gap:8px;justify-content:flex-end}
 .debug{overflow:auto;padding:22px;max-width:1040px;margin:0 auto;width:100%}.debug h1{font-size:18px;margin:0 0 5px}.debug-card{border:1px solid var(--line);background:var(--panel);border-radius:8px;margin:16px 0;overflow:hidden}.debug-head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}.kv{display:grid;grid-template-columns:220px 1fr auto;border-bottom:1px solid var(--line);padding:8px 12px;gap:10px}.kv span:first-child{color:var(--muted);font-family:var(--mono);font-size:11px}.badge{font:11px var(--mono);border-radius:4px;padding:2px 6px;background:var(--panel3);color:var(--muted)}.badge.good{background:rgba(116,199,153,.12);color:var(--good)}.badge.bad{background:rgba(226,118,99,.13);color:var(--bad)}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));border-bottom:1px solid var(--line)}.stat{padding:11px;border-right:1px solid var(--line)}.stat small{display:block;color:var(--muted);font:11px var(--mono);text-transform:uppercase}.stat b{display:block;font-size:18px;margin-top:3px}.toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:20;padding:10px 13px;border:1px solid var(--line2);background:var(--panel2);border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .mobile-filter,.mobile-close{display:none}
 @media(max-width:980px){.main{grid-template-columns:1fr}.side{display:none}.side.mobile-open{display:block;position:absolute;inset:0 auto 0 0;width:min(86vw,320px);z-index:12;box-shadow:0 20px 60px rgba(0,0,0,.45)}.detail{position:absolute;inset:0;background:var(--bg);z-index:5}.detail.empty-detail{display:none}.mobile-filter,.mobile-close{display:inline-flex}.cred .key{width:150px}.brand span{display:none}}
-@media(max-width:640px){.app{grid-template-rows:auto minmax(0,1fr)}.top{height:auto;display:grid;grid-template-columns:1fr auto auto;gap:7px}.brand{grid-column:1/4}.cred{grid-column:1/4}.status{grid-column:1/2}.tabs{display:none}.main{height:auto}.key{width:110px!important}#test-conn{grid-column:2/3}#theme-toggle{grid-column:3/4}.toolbar{height:auto;flex-wrap:wrap}.content{-webkit-line-clamp:5}.grid2{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.row{grid-template-columns:1fr}.debug{padding:12px}.debug-head{flex-wrap:wrap}}
+@media(max-width:640px){.app{grid-template-rows:auto minmax(0,1fr)}.top{height:auto;display:grid;grid-template-columns:1fr auto auto;gap:7px}.brand{grid-column:1/4}.cred{grid-column:1/4}.status{grid-column:1/2}.tabs{display:none}.main{height:auto}.key{width:110px!important}#test-conn{grid-column:2/3}#theme-toggle{grid-column:3/4}.toolbar{height:auto;flex-wrap:wrap}.content{-webkit-line-clamp:5}.grid2,.date-range-inputs{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.row{grid-template-columns:1fr}.debug{padding:12px}.debug-head{flex-wrap:wrap}}
 </style>
 </head>
 <body>
 <div id="app" class="app"></div>
 <script>
 const TYPES = ["note","preference","boundary","relationship","project","excerpt","diary","debug"];
+const LIST_BATCH_SIZE = 1000;
+const MAX_LIST_PAGES = 25;
 const $ = (sel, root=document) => root.querySelector(sel);
 const app = $("#app");
 const state = {
@@ -58,9 +66,10 @@ const state = {
   paging:{ cursor:null, has_more:false, total_count:null, count:0 },
   loading:false,
   saving:false,
+  visibleLimit:100,
   error:"",
   toast:"",
-  filters:{ query:"", top_k:20, filter:true, types:[], source:"", tags:"", pinned:false },
+  filters:{ query:"", top_k:20, filter:true, types:[], source:"", tags:"", pinned:false, sort:"created_desc", date_range:"all", date_from:"", date_to:"" },
   health:null,
   reindex:null,
   reindexCursor:null,
@@ -93,33 +102,80 @@ async function testConnection(){
   try { await request("/v1/memory?limit=1"); state.status = "connected"; toast("连接成功"); await loadList(); }
   catch(e){ state.status = "error"; state.error = e.message; render(); }
 }
-function setFilter(key, value){ state.filters[key] = value; render(); }
-function toggleType(type){ const xs = state.filters.types; state.filters.types = xs.includes(type) ? xs.filter(x=>x!==type) : [...xs,type]; render(); }
+function setFilter(key, value){ state.filters[key] = value; state.visibleLimit = 100; render(); }
+function toggleType(type){ const xs = state.filters.types; state.filters.types = xs.includes(type) ? xs.filter(x=>x!==type) : [...xs,type]; state.visibleLimit = 100; render(); }
+function localDateKey(value){
+  if(!value) return "";
+  const d = new Date(value);
+  if(Number.isNaN(d.getTime())) return "";
+  return [d.getFullYear(), String(d.getMonth()+1).padStart(2,"0"), String(d.getDate()).padStart(2,"0")].join("-");
+}
+function rangeStartKey(days){
+  const d = new Date();
+  d.setHours(0,0,0,0);
+  d.setDate(d.getDate() - Math.max(0, days - 1));
+  return localDateKey(d);
+}
+function compareCreated(a,b){
+  const aTime = new Date(a.created_at || 0).getTime();
+  const bTime = new Date(b.created_at || 0).getTime();
+  const aValid = Number.isFinite(aTime) && aTime > 0;
+  const bValid = Number.isFinite(bTime) && bTime > 0;
+  if(aValid !== bValid) return aValid ? -1 : 1;
+  if(aValid && aTime !== bTime) return state.filters.sort === "created_asc" ? aTime - bTime : bTime - aTime;
+  return String(b.id || "").localeCompare(String(a.id || ""));
+}
 function buildClientFiltered(items){
   const source = state.filters.source.trim().toLowerCase();
   const tagText = state.filters.tags.trim();
   const tags = tagText ? tagText.split(/[,\s，]+/).map(s=>s.trim()).filter(Boolean) : [];
+  const today = localDateKey(new Date());
+  const range = state.filters.date_range;
+  const from = range === "today" ? today : range === "7d" ? rangeStartKey(7) : range === "30d" ? rangeStartKey(30) : range === "custom" ? state.filters.date_from : "";
+  const to = range === "custom" ? state.filters.date_to : range === "all" ? "" : today;
   return items.filter(m => {
     if(source && !(m.source || "").toLowerCase().includes(source)) return false;
     if(tags.length && !tags.every(t => (m.tags || []).includes(t))) return false;
     if(state.filters.pinned && !m.pinned) return false;
+    if(range !== "all") {
+      const created = localDateKey(m.created_at);
+      if(!created) return false;
+      if(from && created < from) return false;
+      if(to && created > to) return false;
+    }
     return true;
-  });
+  }).sort(compareCreated);
 }
 async function loadList(cursor=null, append=false){
-  state.loading = true; state.error = ""; if(!append) state.memories = []; render(append);
+  state.loading = true; state.error = ""; if(!append){ state.memories = []; state.visibleLimit = 100; } render(append);
   try {
-    const data = await request("/v1/memory?limit=100" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""));
-    const incoming = data.data || [];
-    state.memories = append ? [...state.memories, ...incoming] : incoming;
-    state.paging = data.paging || { cursor:null, has_more:false, count:incoming.length };
+    const incoming = append ? [...state.memories] : [];
+    const seenIds = new Set(incoming.map(m=>m.id));
+    const seenCursors = new Set();
+    let nextCursor = cursor;
+    let lastPaging = { cursor:null, has_more:false, count:0 };
+    let pages = 0;
+    while(pages < MAX_LIST_PAGES){
+      const data = await request("/v1/memory?limit="+LIST_BATCH_SIZE+(nextCursor ? "&cursor=" + encodeURIComponent(nextCursor) : ""));
+      for(const memory of (data.data || [])){
+        if(!seenIds.has(memory.id)){ seenIds.add(memory.id); incoming.push(memory); }
+      }
+      lastPaging = data.paging || { cursor:null, has_more:false, count:(data.data || []).length };
+      pages += 1;
+      const candidate = lastPaging.cursor || null;
+      if(!lastPaging.has_more || !candidate || seenCursors.has(candidate)){ nextCursor = null; break; }
+      seenCursors.add(candidate);
+      nextCursor = candidate;
+    }
+    state.memories = incoming;
+    state.paging = { ...lastPaging, cursor:nextCursor, has_more:Boolean(nextCursor && lastPaging.has_more), count:incoming.length, total_count:incoming.length };
     state.status = "connected";
   } catch(e) { state.error = e.message; state.status = state.status === "idle" ? "error" : state.status; }
   state.loading = false; render(append);
 }
 async function searchMemories(){
   if(!state.filters.query.trim()){ await loadList(); return; }
-  state.loading = true; state.error = ""; state.memories = []; render(false);
+  state.loading = true; state.error = ""; state.memories = []; state.visibleLimit = 100; render(false);
   try {
     const body = {
       query: state.filters.query,
@@ -253,6 +309,9 @@ function renderFilters(){
     '<div class="section"><div class="section-head"><b>搜索 · 筛选</b><span><button class="btn ghost mobile-close" id="close-filter">关闭</button> <button class="btn ghost" id="clear-filters">清空</button></span></div><div class="searchbox">'+
     '<input class="input" id="query" placeholder="搜索内容、标签、称呼、规则、触发点" value="'+esc(state.filters.query)+'">'+
     '<button class="btn primary" id="search-btn">搜索</button></div></div>'+
+    '<div class="section"><div class="label">创建时间顺序</div><div class="seg sort-seg"><button class="'+(state.filters.sort==="created_desc"?"active":"")+'" data-sort="created_desc">最新创建</button><button class="'+(state.filters.sort==="created_asc"?"active":"")+'" data-sort="created_asc">最早创建</button></div></div>'+
+    '<div class="section"><div class="label">创建时间范围</div><div class="range-grid">'+[["all","全部"],["today","今天"],["7d","近 7 天"],["30d","近 30 天"],["custom","自定义"]].map(([id,label])=>'<button class="'+(state.filters.date_range===id?"active":"")+'" data-date-range="'+id+'">'+label+'</button>').join("")+'</div>'+
+      (state.filters.date_range==="custom"?'<div class="date-range-inputs"><input class="input" id="date-from" type="date" aria-label="开始日期" value="'+esc(state.filters.date_from)+'"><input class="input" id="date-to" type="date" aria-label="结束日期" value="'+esc(state.filters.date_to)+'"></div>':"")+'</div>'+
     '<div class="section"><div class="label">top_k</div><div class="seg">'+[10,20,50].map(n=>'<button class="'+(state.filters.top_k===n?"active":"")+'" data-topk="'+n+'">'+n+'</button>').join("")+'</div></div>'+
     '<div class="section"><label class="check"><input type="checkbox" id="filter-toggle" '+(state.filters.filter?"checked":"")+'>启用小秘书重排</label><div class="hint" style="margin-top:8px">搜索使用 <span class="mono">POST /v1/memory/search</span>；空 query 则按列表分页读取。</div></div>'+
     '<div class="section"><div class="label">type</div><div class="checkgrid">'+TYPES.map(t=>'<label class="check"><input type="checkbox" data-type="'+t+'" '+(state.filters.types.includes(t)?"checked":"")+'><span class="type">'+t+'</span></label>').join("")+'</div></div>'+
@@ -265,20 +324,21 @@ function memoryCard(m){
   const tags = (m.tags || []).slice(0,8).map(t=>'<span class="tag">'+esc(t)+'</span>').join("");
   const score = typeof m.score === "number" ? '<span class="scores">score '+Number(m.score).toFixed(3)+'</span>' : "";
   return '<article class="card '+(state.active?.id===m.id?"active":"")+'" data-id="'+esc(m.id)+'">'+
-    '<div class="card-top"><span class="type">'+esc(m.type || "note")+'</span><span class="source">'+esc(m.source || "—")+'</span><span class="date">'+shortDate(m.updated_at || m.created_at)+'</span></div>'+
+    '<div class="card-top"><span class="type">'+esc(m.type || "note")+'</span><span class="source">'+esc(m.source || "—")+'</span><span class="date" title="创建于 '+esc(fmtDate(m.created_at))+'">创建 '+shortDate(m.created_at)+'</span></div>'+
     '<div class="content">'+esc(m.content)+'</div>'+
     '<div class="tags">'+tags+'<span class="scores">imp '+scorePct(m.importance)+' · conf '+scorePct(m.confidence)+'</span>'+score+'</div>'+
   '</article>';
 }
 function renderList(){
   const visible = buildClientFiltered(state.memories);
+  const shown = visible.slice(0, state.visibleLimit);
   const meta = state.paging.meta;
-  const subtitle = meta ? (meta.raw_count + " raw · " + meta.count + " kept · " + (meta.filtered ? "rerank" : "raw")) : ((state.paging.total_count ?? visible.length) + " total · vectorize");
+  const subtitle = meta ? (visible.length + " 条符合 · " + meta.raw_count + " 条候选") : (visible.length + " 条符合 · 已读取 " + state.memories.length + " 条");
   return '<main class="list">'+
     '<div class="toolbar"><button class="btn mobile-filter" id="show-filter">筛选</button><h2>记忆</h2><span class="meta">'+esc(subtitle)+'</span><span class="grow"></span><button class="btn" id="refresh">刷新</button><button class="btn primary" id="new-memory">新增记忆</button></div>'+
     (state.error ? '<div class="hint" style="margin:12px;border-color:rgba(226,118,99,.5);color:var(--bad)">'+esc(state.error)+'</div>' : '')+
     (state.loading ? '<div class="empty"><div><b>加载中</b><span class="mono">fetching memory vectors...</span></div></div>' :
-      visible.length ? '<div class="cards">'+visible.map(memoryCard).join("")+(state.paging.has_more && !state.filters.query.trim() ? '<button class="btn" style="width:100%" id="load-more">继续加载 cursor</button>' : '')+'</div>' :
+      visible.length ? '<div class="cards">'+shown.map(memoryCard).join("")+(shown.length < visible.length ? '<button class="btn" style="width:100%" id="show-more">再显示 '+Math.min(100, visible.length-shown.length)+' 条</button>' : '')+(state.paging.has_more && !state.filters.query.trim() ? '<button class="btn" style="width:100%;margin-top:8px" id="load-more">继续读取剩余记忆</button>' : '')+'</div>' :
       '<div class="empty"><div><b>没有记忆</b><span>搜索无结果，或还没有连接到 Worker。</span></div></div>')+
   '</main>';
 }
@@ -366,26 +426,43 @@ function render(preserveScroll=true){
   bind();
   restoreScroll(scroll);
 }
+function renderListOnly(){
+  const current = $(".list");
+  if(!current) return;
+  const scrollTop = current.scrollTop;
+  current.outerHTML = renderList();
+  bindList();
+  const next = $(".list");
+  if(next) next.scrollTop = scrollTop;
+}
+function bindList(){
+  $("#refresh")?.addEventListener("click", ()=> state.filters.query.trim() ? searchMemories() : loadList());
+  $("#new-memory")?.addEventListener("click", createMemory);
+  $("#load-more")?.addEventListener("click", ()=>loadList(state.paging.cursor, true));
+  $("#show-more")?.addEventListener("click", ()=>{ state.visibleLimit += 100; renderListOnly(); });
+  document.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{ state.active = state.memories.find(m=>m.id===c.dataset.id) || null; render(); }));
+}
 function bind(){
   $("#worker-url")?.addEventListener("input", e=>{ state.workerUrl=e.target.value; savePrefs(); });
   $("#api-key")?.addEventListener("input", e=>{ state.apiKey=e.target.value; savePrefs(); });
   $("#test-conn")?.addEventListener("click", testConnection);
   $("#theme-toggle")?.addEventListener("click", ()=>{ state.theme = state.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = state.theme; savePrefs(); render(); });
   document.querySelectorAll("[data-tab]").forEach(b=>b.addEventListener("click",()=>{ state.tab=b.dataset.tab; render(); }));
-  $("#query")?.addEventListener("input", e=>setFilter("query", e.target.value));
+  $("#query")?.addEventListener("input", e=>{ state.filters.query = e.target.value; });
   $("#query")?.addEventListener("keydown", e=>{ if(e.key==="Enter") searchMemories(); });
   $("#search-btn")?.addEventListener("click", searchMemories);
-  $("#clear-filters")?.addEventListener("click", ()=>{ state.filters={ query:"", top_k:20, filter:true, types:[], source:"", tags:"", pinned:false }; render(); });
+  $("#clear-filters")?.addEventListener("click", ()=>{ state.filters={ query:"", top_k:20, filter:true, types:[], source:"", tags:"", pinned:false, sort:"created_desc", date_range:"all", date_from:"", date_to:"" }; state.visibleLimit = 100; render(); });
+  document.querySelectorAll("[data-sort]").forEach(b=>b.addEventListener("click",()=>setFilter("sort", b.dataset.sort)));
+  document.querySelectorAll("[data-date-range]").forEach(b=>b.addEventListener("click",()=>setFilter("date_range", b.dataset.dateRange)));
+  $("#date-from")?.addEventListener("change", e=>setFilter("date_from", e.target.value));
+  $("#date-to")?.addEventListener("change", e=>setFilter("date_to", e.target.value));
   document.querySelectorAll("[data-topk]").forEach(b=>b.addEventListener("click",()=>setFilter("top_k", Number(b.dataset.topk))));
   document.querySelectorAll("[data-type]").forEach(i=>i.addEventListener("change",()=>toggleType(i.dataset.type)));
   $("#filter-toggle")?.addEventListener("change", e=>setFilter("filter", e.target.checked));
-  $("#source-filter")?.addEventListener("input", e=>setFilter("source", e.target.value));
-  $("#tags-filter")?.addEventListener("input", e=>setFilter("tags", e.target.value));
+  $("#source-filter")?.addEventListener("input", e=>{ state.filters.source = e.target.value; state.visibleLimit = 100; renderListOnly(); });
+  $("#tags-filter")?.addEventListener("input", e=>{ state.filters.tags = e.target.value; state.visibleLimit = 100; renderListOnly(); });
   $("#pinned-filter")?.addEventListener("change", e=>setFilter("pinned", e.target.checked));
-  $("#refresh")?.addEventListener("click", ()=> state.filters.query.trim() ? searchMemories() : loadList());
-  $("#new-memory")?.addEventListener("click", createMemory);
-  $("#load-more")?.addEventListener("click", ()=>loadList(state.paging.cursor, true));
-  document.querySelectorAll(".card").forEach(c=>c.addEventListener("click",()=>{ state.active = state.memories.find(m=>m.id===c.dataset.id) || null; render(); }));
+  bindList();
   $("#close-detail")?.addEventListener("click", ()=>{ state.active=null; render(); });
   $("#reset-detail")?.addEventListener("click", ()=>render());
   $("#save-memory")?.addEventListener("click", saveMemory);

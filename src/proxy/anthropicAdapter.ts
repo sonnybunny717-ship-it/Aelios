@@ -1,6 +1,11 @@
 import { buildStableMemoryPack } from "../memory/stablePack";
 import type { AssembledPrompt } from "../assembler/types";
-import { assembledToAnthropicMessages, assembledToAnthropicSystem } from "../assembler/toAnthropic";
+import {
+  assembledToAnthropicMessages,
+  assembledToAnthropicSystem,
+  openAIContentToAnthropicBlocks,
+} from "../assembler/toAnthropic";
+import type { AnthropicContentBlock } from "../assembler/toAnthropic";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse, TokenUsage } from "../types";
 import { formatMemoryPatch } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
@@ -16,7 +21,7 @@ interface AnthropicTextBlock {
 
 interface AnthropicMessage {
   role: "user" | "assistant";
-  content: AnthropicTextBlock[];
+  content: AnthropicContentBlock[];
 }
 
 type AdaptiveEffort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -66,7 +71,7 @@ interface CloudflareFableRequest {
   system?: string;
   messages: Array<{
     role: AnthropicMessage["role"];
-    content: AnthropicTextBlock[];
+    content: AnthropicContentBlock[];
   }>;
 }
 
@@ -448,18 +453,19 @@ function convertMessages(messages: OpenAIChatMessage[]): AnthropicMessage[] {
   for (const message of messages) {
     if (message.role === "system") continue;
     const role = message.role === "assistant" ? "assistant" : "user";
-    const text = contentToText(message.content);
-    if (!text) continue;
+    const blocks = openAIContentToAnthropicBlocks(message.content);
+    const hasContent = blocks.some((block) => block.type === "image" || Boolean(block.text));
+    if (!hasContent) continue;
 
     const previous = result[result.length - 1];
     if (previous?.role === role) {
-      previous.content.push({ type: "text", text });
+      previous.content.push(...blocks);
       continue;
     }
 
     result.push({
       role,
-      content: [{ type: "text", text }]
+      content: blocks
     });
   }
 
@@ -545,8 +551,7 @@ export async function buildAnthropicNativeRequest(
  * Build an Anthropic native request from an AssembledPrompt.
  *
  * - System blocks are converted via assembledToAnthropicSystem
- * - Messages via assembledToAnthropicMessages
- *   (structured content like image_url is JSON.stringify'd — temporary fallback)
+ * - Messages via assembledToAnthropicMessages, including native image blocks
  * - dynamic_memory_patch is moved out of system and appended after the
  *   rolling cache point, so changing RAG hits do not poison cached prefixes
  * - cache_control is applied to the client_system anchor block and the

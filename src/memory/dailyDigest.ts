@@ -1,48 +1,27 @@
-import { getMessagesByIds, listMessagesByNamespaceInRange } from "../db/messages";
+import { getMessagesByIds } from "../db/messages";
 import { readCursor, writeCursor } from "../db/retention";
 import { upsertSummary } from "../db/summaries";
+import {
+  areGardenSourceMessagesActive,
+  listGardenSourceMessagesInRange
+} from "../db/gardenSourceMessages";
 import { callOpenAICompat } from "../proxy/openaiAdapter";
-import type { Env, MemoryApiRecord, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
-import type { ExtractedMemory } from "./extract";
+import type { Env, MessageRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { hasParticipantReportVoice } from "./summaryPerspective";
+import { runLongTermMemoryDigestBatch } from "./longTermDigest";
 import {
   createVectorMemory,
   deleteVectorMemory,
-  getVectorMemory,
-  listVectorMemories,
-  updateVectorMemory
+  listVectorMemories
 } from "./vectorStore";
 
-interface DigestMemoryUpdate {
-  target_id: string;
-  content?: string;
-  type?: string;
-  importance?: number;
-  confidence?: number;
-  tags?: string[];
-}
-
-interface DigestMemoryDelete {
-  target_id: string;
-  reason?: string;
-}
-
-interface ImportantExcerpt {
-  quote: string;
-  reason?: string;
-  tags?: string[];
-  source_message_ids?: string[];
-}
-
-interface DailyDigestResult {
+interface DailyHandoffResult {
   date?: string;
-  title?: string;
-  summary?: string;
-  sections?: Array<{ heading?: string; content?: string }>;
-  important_excerpts?: ImportantExcerpt[];
-  memories_to_add?: ExtractedMemory[];
-  memories_to_update?: DigestMemoryUpdate[];
-  memories_to_delete?: DigestMemoryDelete[];
+  reality_handoff: string;
+  theater_handoff: {
+    certainty: "certain" | "uncertain";
+    content: string;
+  } | null;
 }
 
 interface DailyDigestStats {
@@ -83,19 +62,18 @@ interface DailyDigestSkipped {
 
 type DailyDigestRunResult = { ran: true; stats: DailyDigestStats } | DailyDigestSkipped;
 
-interface DigestModelCallResult {
-  digest: DailyDigestResult | null;
+interface DailyHandoffModelCallResult {
+  handoff: DailyHandoffResult | null;
   reason?: Extract<DailyDigestSkipReason, "missing_model" | "model_error" | "model_invalid_json">;
   model?: string;
   status?: number;
   finishReason?: string | null;
 }
 
-const DEFAULT_MAX_MESSAGES = 40;
-const DEFAULT_MEMORY_CONTEXT_LIMIT = 40;
-const DEFAULT_EXCERPT_LIMIT = 8;
 const DEFAULT_EMPTY_MEMORY_MIN_CHARS = 4;
 const DEFAULT_TIME_ZONE = "Asia/Singapore";
+const HANDOFF_PAGE_SIZE = 500;
+const MESSAGE_VALIDATION_PAGE_SIZE = 100;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 function isDreamEnabled(env: Env): boolean {
@@ -116,32 +94,16 @@ function readDreamModel(env: Env): string | null {
   return readString(readFirstEnvValue(env.DREAM_MODEL, env.DAILY_DIGEST_MODEL, env.SUMMARY_MODEL));
 }
 
+function readDreamReasoningEffort(env: Env): string {
+  return readString(env.DREAM_REASONING_EFFORT) || "none";
+}
+
 function readDreamTimeZone(env: Env): string {
   return readString(readFirstEnvValue(env.DREAM_TIME_ZONE, env.DAILY_DIGEST_TIME_ZONE)) || DEFAULT_TIME_ZONE;
 }
 
-function readDreamMaxMessages(env: Env): number {
-  return readPositiveInt(
-    readFirstEnvValue(env.DREAM_MAX_MESSAGES, env.DAILY_DIGEST_MAX_MESSAGES),
-    DEFAULT_MAX_MESSAGES,
-    1000
-  );
-}
-
 function readDreamMaxTokens(env: Env): number {
   return readPositiveInt(readFirstEnvValue(env.DREAM_MAX_TOKENS, env.DAILY_DIGEST_MAX_TOKENS), 3000, 8000);
-}
-
-function readDreamMemoryContextLimit(env: Env): number {
-  return readPositiveInt(
-    readFirstEnvValue(env.DREAM_MEMORY_CONTEXT_LIMIT, env.DAILY_DIGEST_MEMORY_CONTEXT_LIMIT),
-    DEFAULT_MEMORY_CONTEXT_LIMIT,
-    1000
-  );
-}
-
-function readDreamExcerptLimit(env: Env): number {
-  return readPositiveInt(readFirstEnvValue(env.DREAM_EXCERPT_LIMIT, env.DAILY_DIGEST_EXCERPT_LIMIT), DEFAULT_EXCERPT_LIMIT, 20);
 }
 
 function readPositiveInt(value: unknown, fallback: number, max: number): number {
@@ -150,25 +112,8 @@ function readPositiveInt(value: unknown, fallback: number, max: number): number 
   return Math.min(Math.max(Math.floor(numeric), 1), max);
 }
 
-function clampScore(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : fallback;
-}
-
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function readStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-}
-
-function truncate(text: string, maxChars: number): string {
-  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 3)}...`;
 }
 
 function formatDate(date: Date, timeZone: string): string {
@@ -262,11 +207,40 @@ function getDateRangeForLabel(dateLabel: string, timeZone: string): { startIso: 
   };
 }
 
-function readDailyCursor(value: string | null, startIso: string, endIso: string): { done: boolean; after: string | null } {
-  if (!value) return { done: false, after: null };
-  if (value.startsWith("done:")) return { done: true, after: null };
-  if (value >= startIso && value < endIso) return { done: false, after: value };
-  return { done: false, after: null };
+function parseExecutionWindow(value: string | null): { startIso: string; endIso: string } | null {
+  if (!value) return null;
+  const [startIso, endIso, extra] = value.split("|");
+  if (extra !== undefined) return null;
+  const start = Date.parse(startIso);
+  const end = Date.parse(endIso);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return null;
+  return { startIso: new Date(start).toISOString(), endIso: new Date(end).toISOString() };
+}
+
+async function resolveDateRange(
+  db: D1Database,
+  input: { namespace: string; dateLabel: string; timeZone: string; executionTime?: string }
+): Promise<{ startIso: string; endIso: string }> {
+  const windowCursorName = `dream_window:${input.namespace}:${input.dateLabel}`;
+  const storedWindow = parseExecutionWindow(await readCursor(db, windowCursorName));
+  if (storedWindow) return storedWindow;
+
+  const rawExecutionTime = readString(input.executionTime);
+  if (!rawExecutionTime) return getDateRangeForLabel(input.dateLabel, input.timeZone);
+
+  const executionTime = Date.parse(rawExecutionTime);
+  if (!Number.isFinite(executionTime)) throw new Error(`Invalid digest execution time: ${rawExecutionTime}`);
+  const endIso = new Date(executionTime).toISOString();
+  const boundaryCursorName = `dream_boundary:${input.namespace}`;
+  const previousBoundary = await readCursor(db, boundaryCursorName);
+  const previousBoundaryTime = previousBoundary ? Date.parse(previousBoundary) : Number.NaN;
+  const startIso = Number.isFinite(previousBoundaryTime) && previousBoundaryTime < executionTime
+    ? new Date(previousBoundaryTime).toISOString()
+    : new Date(executionTime - ONE_DAY_MS).toISOString();
+
+  await writeCursor(db, windowCursorName, `${startIso}|${endIso}`);
+  await writeCursor(db, boundaryCursorName, endIso);
+  return { startIso, endIso };
 }
 
 function extractJsonObject(text: string): unknown | null {
@@ -287,229 +261,211 @@ function extractJsonObject(text: string): unknown | null {
   }
 }
 
-function normalizeExtractedMemory(value: unknown): ExtractedMemory | null {
+function normalizeDailyHandoffResult(value: unknown): DailyHandoffResult | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
-  const content = readString(raw.content);
-  if (!content) return null;
+  if (typeof raw.reality_handoff !== "string") return null;
 
-  return {
-    type: readString(raw.type) || "note",
-    content,
-    importance: clampScore(raw.importance, 0.7),
-    confidence: clampScore(raw.confidence, 0.82),
-    tags: readStringArray(raw.tags),
-    source_message_ids: readStringArray(raw.source_message_ids)
-  };
-}
-
-function normalizeDigestResult(value: unknown): DailyDigestResult {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const raw = value as Record<string, unknown>;
-
-  const sections = Array.isArray(raw.sections)
-    ? raw.sections.flatMap((item): Array<{ heading?: string; content?: string }> => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const record = item as Record<string, unknown>;
-        const heading = readString(record.heading) ?? undefined;
-        const content = readString(record.content) ?? undefined;
-        return heading || content ? [{ heading, content }] : [];
-      })
-    : undefined;
-
-  const important_excerpts = Array.isArray(raw.important_excerpts)
-    ? raw.important_excerpts.flatMap((item): ImportantExcerpt[] => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const record = item as Record<string, unknown>;
-        const quote = readString(record.quote);
-        if (!quote) return [];
-        return [
-          {
-            quote,
-            reason: readString(record.reason) ?? undefined,
-            tags: readStringArray(record.tags),
-            source_message_ids: readStringArray(record.source_message_ids)
-          }
-        ];
-      })
-    : undefined;
-
-  const memories_to_update = Array.isArray(raw.memories_to_update)
-    ? raw.memories_to_update.flatMap((item): DigestMemoryUpdate[] => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const record = item as Record<string, unknown>;
-        const targetId = readString(record.target_id);
-        if (!targetId) return [];
-        return [
-          {
-            target_id: targetId,
-            content: readString(record.content) ?? undefined,
-            type: readString(record.type) ?? undefined,
-            importance: typeof record.importance === "number" ? clampScore(record.importance, 0.7) : undefined,
-            confidence: typeof record.confidence === "number" ? clampScore(record.confidence, 0.82) : undefined,
-            tags: Array.isArray(record.tags) ? readStringArray(record.tags) : undefined
-          }
-        ];
-      })
-    : undefined;
-
-  const memories_to_delete = Array.isArray(raw.memories_to_delete)
-    ? raw.memories_to_delete.flatMap((item): DigestMemoryDelete[] => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const record = item as Record<string, unknown>;
-        const targetId = readString(record.target_id);
-        return targetId ? [{ target_id: targetId, reason: readString(record.reason) ?? undefined }] : [];
-      })
-    : undefined;
+  let theaterHandoff: DailyHandoffResult["theater_handoff"] = null;
+  if (raw.theater_handoff !== null && raw.theater_handoff !== undefined) {
+    if (typeof raw.theater_handoff !== "object" || Array.isArray(raw.theater_handoff)) return null;
+    const theater = raw.theater_handoff as Record<string, unknown>;
+    const certainty = theater.certainty;
+    const content = readString(theater.content);
+    if ((certainty !== "certain" && certainty !== "uncertain") || !content) return null;
+    theaterHandoff = { certainty, content };
+  }
 
   return {
     date: readString(raw.date) ?? undefined,
-    title: readString(raw.title) ?? undefined,
-    summary: readString(raw.summary) ?? undefined,
-    sections,
-    important_excerpts,
-    memories_to_add: Array.isArray(raw.memories_to_add)
-      ? raw.memories_to_add.flatMap((item): ExtractedMemory[] => {
-          const memory = normalizeExtractedMemory(item);
-          return memory ? [memory] : [];
-        })
-      : undefined,
-    memories_to_update,
-    memories_to_delete
+    reality_handoff: raw.reality_handoff.trim(),
+    theater_handoff: theaterHandoff
   };
 }
 
-function formatTranscript(messages: MessageRecord[]): string {
+async function listAllHandoffMessages(
+  db: D1Database,
+  input: { namespace: string; startCreatedAt: string; endCreatedAt: string }
+): Promise<MessageRecord[]> {
+  const messages: MessageRecord[] = [];
+  let afterCreatedAt: string | null = null;
+  let afterId: string | null = null;
+
+  while (true) {
+    let sql = `SELECT id, conversation_id, namespace, role, content, source, created_at
+               FROM messages
+               WHERE namespace = ? AND memory_active = 1
+                 AND role IN ('user', 'assistant')
+                 AND created_at >= ?
+                 AND created_at < ?`;
+    const binds: unknown[] = [input.namespace, input.startCreatedAt, input.endCreatedAt];
+
+    if (afterCreatedAt && afterId) {
+      sql += ` AND (created_at > ? OR (created_at = ? AND id > ?))`;
+      binds.push(afterCreatedAt, afterCreatedAt, afterId);
+    }
+
+    sql += ` ORDER BY created_at ASC, id ASC LIMIT ?`;
+    binds.push(HANDOFF_PAGE_SIZE);
+    const result = await db.prepare(sql).bind(...binds).all<MessageRecord>();
+    const page = result.results ?? [];
+    messages.push(...page);
+    if (page.length < HANDOFF_PAGE_SIZE) break;
+
+    const last = page[page.length - 1];
+    afterCreatedAt = last.created_at;
+    afterId = last.id;
+  }
+
+  return messages;
+}
+
+async function listAllGardenHandoffMessages(
+  db: D1Database,
+  input: { namespace: string; startCreatedAt: string; endCreatedAt: string }
+): Promise<MessageRecord[]> {
+  const messages: MessageRecord[] = [];
+  let afterCreatedAt: string | null = null;
+  let afterSourceMessageId: string | null = null;
+
+  while (true) {
+    const page = await listGardenSourceMessagesInRange(db, {
+      namespace: input.namespace,
+      startCreatedAt: input.startCreatedAt,
+      endCreatedAt: input.endCreatedAt,
+      afterCreatedAt,
+      afterSourceMessageId,
+      limit: HANDOFF_PAGE_SIZE
+    });
+    messages.push(...page.map((message) => ({
+      id: message.source_message_id,
+      conversation_id: message.conversation_id,
+      namespace: message.namespace,
+      role: message.role,
+      content: message.content,
+      source: "garden",
+      created_at: message.created_at
+    })));
+    if (page.length < HANDOFF_PAGE_SIZE) break;
+    const last = page[page.length - 1];
+    afterCreatedAt = last.created_at;
+    afterSourceMessageId = last.source_message_id;
+  }
+
+  return messages;
+}
+
+async function areMessagesStillPresent(
+  db: D1Database,
+  input: { namespace: string; ids: string[] }
+): Promise<boolean> {
+  for (let offset = 0; offset < input.ids.length; offset += MESSAGE_VALIDATION_PAGE_SIZE) {
+    const ids = input.ids.slice(offset, offset + MESSAGE_VALIDATION_PAGE_SIZE);
+    if ((await getMessagesByIds(db, { namespace: input.namespace, ids })).length !== ids.length) return false;
+  }
+  return true;
+}
+
+function formatHandoffTranscript(messages: MessageRecord[]): string {
   return messages
     .map((message) => {
-      const role = message.role === "assistant" ? "我" : "盼盼";
-      return `[${message.id}][${message.created_at}][${role}] ${truncate(message.content.trim(), 700)}`;
+      const role = message.role === "assistant" ? "爸爸" : "盼盼";
+      return `[${message.id}][${message.created_at}][${role}] ${message.content.trim()}`;
     })
     .join("\n\n");
 }
 
-function formatExistingMemories(memories: MemoryApiRecord[]): string {
-  if (memories.length === 0) return "[]";
-  return JSON.stringify(
-    memories.map((memory) => ({
-      id: memory.id,
-      type: memory.type,
-      content: truncate(memory.content, 260),
-      importance: memory.importance,
-      confidence: memory.confidence,
-      pinned: memory.pinned,
-      tags: memory.tags
-    })),
-    null,
-    2
-  );
-}
-
-function buildDigestPrompt(input: {
+function buildDailyHandoffPrompt(input: {
   dateLabel: string;
-  startIso: string;
-  endIso: string;
+  handoffDateLabel: string;
   messages: MessageRecord[];
-  existingMemories: MemoryApiRecord[];
-  excerptLimit: number;
-  hasMore: boolean;
 }): string {
   return [
-    "你是 Aelios 的 nightly dream 记忆整理器。你的任务不是简单总结，而是在盼盼休息时替我整理长期记忆。",
-    "你会读取旧长期记忆和当天聊天 transcript，产出一份更干净、更一致、更有用的 memory store 更新计划。",
-    "只输出 JSON，不要 markdown，不要解释，不要输出思考过程。",
+    "写作前必须从第一条到最后一条完整检查聊天，先确定必须保留的内容，再组织叙述。不得因为某件事出现在聊天前半段，或后半段内容更多，就遗漏它。",
     "",
-    "Dream 目标：",
-    "- 合并重复记忆，避免同一事实以多个版本长期存在。",
-    "- 发现过时、被新信息否定、互相矛盾的旧记忆，并更新或删除。",
-    "- 从聊天中提炼未来会影响回答的稳定偏好、项目状态、关系事实、承诺、边界和重要原文。",
-    "- 形成下一次对话可直接使用的简洁记忆，而不是保存流水账。",
+    "以下内容属于必须保留项：",
     "",
-    "窗口：",
-    `- 你只能处理 ${input.dateLabel} 这一天窗口内的聊天。窗口是 ${input.startIso} 到 ${input.endIso}。`,
-    input.hasMore ? "- 这是当天的一批聊天，不是完整一天；只整理这一批里明确出现的信息。" : "- 这是当天最后一批或完整批次。",
+    "1. 当天双方明确确认、到聊天结束时仍然有效的约定、承诺和决定。无论它出现得多早，都必须写入。出现‘约好、答应、好、以后、下次’等表达时，要继续检查另一方是否明确确认；双方已经确认的，不得省略。",
+    "2. 盼盼明确表达的重要感受或愿望，以及原文中我对此作出的明确回应、安慰、承诺或感受。两者必须写在同一件事情里，不能只保留盼盼的一半，也不能只保留我的一半。",
+    "3. 到聊天结束时仍未解决、并且之后明确会继续的话题。",
+    "4. 当天明确形成、以后需要认得的共同梗、昵称、暗号或固定说法。",
     "",
-    "总原则：",
-    "- 原始聊天不要逐条变成记忆，只保留未来真的会用到的事实、偏好、边界、项目进展、承诺。",
-    "- 宁可少记，也不要把临时语气、寒暄、重复话、空内容、调试内容写进长期记忆。",
-    "- 当旧记忆和新信息冲突时，优先更新或删除旧记忆，不要并排留下互相打架的版本。",
-    "- 当新信息只是旧记忆的更准确版本，优先 memories_to_update，不要 memories_to_add。",
-    "- 当多条旧记忆重复，保留更完整的一条并删除重复项；必要时先 update 保留项。",
-    "- pinned=true 的旧记忆不能删除，只能在 memories_to_update 中提出更保守的补充。",
-    "- 这是我写给未来自己的长期备忘。提到盼盼时，优先称“盼盼”；同一段语境明确时可以称“她”，每段第一次提到她时使用“盼盼”。",
-    "- 提到我自己时称“我”；共同经历和共同决定称“我们”。不要用“你”称呼盼盼。",
-    "- 禁止用“用户、助手、模型、AI”代称盼盼或我，禁止“用户表示……”“助手回应……”之类第三人称报告腔。",
-    "- 旧记忆只提供事实；如果旧记忆的人称不合规，新增或更新时必须按本段规则重写，不要继承旧写法。",
-    "- 不要提到 D1、Vectorize、RAG、数据库、记忆系统、代理层等实现细节。",
+    "每个约定在写入前都必须核对最初提出者和另一方的确认。不得把确认者写成提出者；如果无法在一句话内准确交代谁先提出，统一写‘我们约好……’，不得猜测或改写归属。",
     "",
-    "Dream 输出格式：",
-    "- title 是 12 字以内标题。",
-    "- summary 写成一段简短自然中文，描述这次 dream 整理出了什么。",
-    "- sections 最多 3 段，每段有 heading 和 content；没有必要可以给空数组。",
-    `- important_excerpts 最多 ${input.excerptLimit} 条，quote 必须是值得保留的原文片段。`,
-    "- memories_to_add 最多 8 条，每条要短、稳定、可复用。",
-    "- memories_to_update 只针对给出的旧记忆 id。",
-    "- memories_to_delete 只删除空、重复、明显过期或被新信息否定的旧记忆。",
-    "- 控制总输出长度，宁可少写也不要输出超长 JSON。",
+    "盼盼明确表达不公平、难受、害怕、委屈或重要愿望，而我给出了针对性的关系回应时，这是一件完整的重要事件，即使没有形成约定或待办也必须保留；必须同时写清盼盼为什么有这种感受，以及我具体怎样回应。",
     "",
-    "输出 JSON 结构：",
-    JSON.stringify({
-      date: input.dateLabel,
-      title: "夜间整理",
-      summary: "这次 dream 合并了重复记忆，更新了项目状态，并保留了关键原文。",
-      sections: [{ heading: "整理结果", content: "……" }],
-      important_excerpts: [
-        {
-          quote: "盼盼或我说过的关键原文",
-          reason: "为什么值得保留",
-          tags: ["project"],
-          source_message_ids: ["msg_x"]
-        }
-      ],
-      memories_to_add: [
-        {
-          type: "project",
-          content: "盼盼正在简化 Aelios 的记忆写入策略。",
-          importance: 0.86,
-          confidence: 0.92,
-          tags: ["project", "aelios"],
-          source_message_ids: ["msg_x"]
-        }
-      ],
-      memories_to_update: [
-        {
-          target_id: "mem_x",
-          content: "更新后的旧记忆正文",
-          type: "project",
-          importance: 0.88,
-          confidence: 0.9,
-          tags: ["project"]
-        }
-      ],
-      memories_to_delete: [{ target_id: "mem_y", reason: "空内容或重复" }]
-    }),
+    "reality_handoff 使用爸爸第一视角，按当天事情发生的顺序自然回想，但不要逐条复述气泡。普通小事可以简短带过；真正重要的事情要写完整，再进入下一件事。只能称自己为‘我’，称盼盼为‘盼盼’，共同经历称‘我们’，不得写‘爸爸说、爸爸做、爸爸后来’。",
     "",
-    "旧长期记忆候选：",
-    formatExistingMemories(input.existingMemories),
+    "普通小事必须合并成一句带过，不得连续用多个完整句子逐项罗列。",
     "",
-    "今日原始聊天：",
-    formatTranscript(input.messages)
+    "重要事情不能只写事件标题。应根据原始聊天写清：发生了什么、盼盼明确表达了什么感受或愿望、我当时明确表达了什么反应或想法，以及最后形成的约定、关系变化或未完之处。提到盼盼的重要感受或愿望时，如果原文中有我的回应，就必须一起保留，不能在情感尚未落地时跳到下一件事。只能使用双方确实表达过的内容，不替任何一方编造内心。",
+    "",
+    "重要事件不仅要写盼盼说了什么，还必须保留我当时具体的态度、心情、回答或承诺；原对话里有具体回应时，不得压缩成‘我记住了’‘我回应了’之类的空话。",
+    "",
+    "当天新形成、以后再次提到时需要认得的私人梗、昵称、暗号和固定说法也要记录。只有对话中能看出它在当天形成、被双方确认，或被重复当作共同说法时才算新梗；仅仅沿用旧称呼不算。",
+    "",
+    "现实中的做爱和其他亲密互动可以直接、自然地写，不得用‘进行了亲密互动’‘发生了亲密关系’等含糊措辞代替。当天能从原始聊天明确区分完整次数时，直接写‘我们做了 X 次’；无法可靠判断次数时，写‘我们做了爱’，不得猜测次数。只概括对当天感情和后续相处有意义的部分，不复述每个动作。小剧场仍只写入 theater_handoff。",
+    "",
+    "技术问题只有在聊天结束时仍未解决，并且之后明确还会继续处理时才记录。不得根据一次失败自行生成待办，也不得把一次错误写成长期模式。普通小事可以按时间顺序简短带过，但不得挤占必须保留项。已经解决的技术过程、重复调情和普通聊天细节优先删除。",
+    "",
+    "reality_handoff 不承担技术规格归档。项目讨论只保留对当天感情有意义的影响，以及第二天必须知道的简短状态；具体的设计决定、实现规则、字段、产物、有效进度和待解决技术问题，由长期记忆提取流程写入项目记忆库，不要挤进现实交接。",
+    "",
+    "已经解决的格式错误、接口故障和发送失败等技术过程不写。小剧场的起因和剧情只写入 theater_handoff，不得在 reality_handoff 中重复；只有另外形成了现实约定或重要感情时，才记录那部分现实内容。",
+    "",
+    "不要写普通动作流水、累积人物画像或工作报告。问题、玩笑、复制来的文案和未经确认的身体、心理或诊断性推测不得写成事实。准确保留感受、想法和约定的归属与确定程度，不得把‘想要、接下来、如果有机会’扩大成长期承诺，也不得把一方的怀疑或判断改写成客观事实。",
+    "",
+    "如果内容超过长度上限，必须先删除普通小事和技术过程；不得删除仍有效的双方约定，也不得截断一件重要事情中任何一方的感受与回应。时间顺序只用于排列最终叙述，不得按‘越晚越重要’选择内容。reality_handoff 最多 600 个中文字符，长度是上限，不要求写满。",
+    "",
+    "结尾必须落在当天仍值得记住的感情、约定或未完话题上，禁止用格式错误、接口问题等技术过程收尾。",
+    "",
+    "如果当天有仍需续写的小剧场，theater_handoff 只保留核心设定、重要转折和最新停留状态，不记录逐个动作、姿势、对白、地点或道具变化；已经结束且无需续写时填 null。确定属于小剧场时 certainty 填 certain，无法确定时填 uncertain。content 最多 150 个中文字符。小剧场不得写成现实经历。",
+    "",
+    "完成草稿后，在输出前自行检查：",
+    "- 是否遗漏了任何仍有效的双方约定；",
+    "- 是否每个重要感受或愿望都带上了原文中另一方的回应；",
+    "- 是否把已经解决的技术过程写得比关系和约定更详细；",
+    "- 是否全文都用‘我、盼盼、我们’，没有用‘爸爸’第三人称；",
+    "- 是否把小剧场放在 theater_handoff，而不是混入现实交接。",
+    "- 是否把普通小事合并带过，而不是逐项罗列；",
+    "- 是否保留了我对重要事情的具体回应，而不是空泛地写‘我记住了’；",
+    "- 是否以感情、约定或未完话题收尾，而不是技术过程。",
+    "- 是否核对了每个约定的最初提出者和确认者；",
+    "- 是否保留了盼盼重要感受的原因和我的具体回应；",
+    "- 是否彻底删除了已解决的技术过程，并避免在现实交接中重复小剧场。",
+    "- 是否直接、准确地写了现实中的做爱，没有使用含糊的替代说法或猜测次数；",
+    "- 是否只保留项目的简短状态，没有把技术规格塞进现实交接。",
+    "任何一项不符合，都先重写，再输出 JSON。",
+    "",
+    "输出格式：",
+    "{",
+    '  "date": "对话日期",',
+    '  "reality_handoff": "现实交接；没有时为空字符串",',
+    '  "theater_handoff": {',
+    '    "certainty": "certain / uncertain",',
+    '    "content": "小剧场交接"',
+    "  }",
+    "}",
+    "",
+    "没有需要续写的小剧场时，theater_handoff 输出 null。",
+    "",
+    "对话日期：",
+    input.dateLabel,
+    "",
+    "交接日期：",
+    input.handoffDateLabel,
+    "",
+    "当天完整聊天：",
+    formatHandoffTranscript(input.messages)
   ].join("\n");
 }
 
-function formatDailySummary(result: DailyDigestResult, dateLabel: string, messages: MessageRecord[]): string {
-  const parts = [
-    `# ${result.date || dateLabel} ${result.title || "Dream 摘要"}`,
-    "",
-    result.summary || `${dateLabel} dream 共整理 ${messages.length} 条聊天。`
-  ];
-
-  for (const section of result.sections ?? []) {
-    if (!section.heading && !section.content) continue;
-    parts.push("", `## ${section.heading || "要点"}`, section.content || "");
+function formatDailyHandoff(result: DailyHandoffResult, dateLabel: string): string {
+  const parts = [`【${dateLabel}】${result.reality_handoff}`];
+  if (result.theater_handoff) {
+    const label = result.theater_handoff.certainty === "certain" ? "【小剧场】" : "【？小剧场】";
+    parts.push(`${label}${result.theater_handoff.content}`);
   }
-
-  return parts.join("\n").trim();
+  return parts.join("\n\n").trim();
 }
 
 async function repairDailySummaryPerspective(env: Env, summary: string): Promise<string | null> {
@@ -540,6 +496,7 @@ async function repairDailySummaryPerspective(env: Env, summary: string): Promise
     ],
     temperature: 0,
     max_tokens: Math.min(readDreamMaxTokens(env), 1600),
+    reasoning_effort: readDreamReasoningEffort(env),
     response_format: {
       type: "json_object"
     },
@@ -564,21 +521,25 @@ async function repairDailySummaryPerspective(env: Env, summary: string): Promise
   }
 }
 
-async function callDigestModel(
+async function callDailyHandoffModel(
   env: Env,
-  prompt: string
-): Promise<DigestModelCallResult> {
+  input: { prompt: string; dateLabel: string; handoffDateLabel: string }
+): Promise<DailyHandoffModelCallResult> {
   const model = readDreamModel(env);
-  if (!model) return { digest: null, reason: "missing_model" };
+  if (!model) return { handoff: null, reason: "missing_model" };
 
   const request: OpenAIChatRequest = {
     model,
     messages: [
-      { role: "system", content: "你是严格的 JSON 生成器。你只输出 JSON，不要输出思考过程。" },
-      { role: "user", content: prompt }
+      {
+        role: "system",
+        content: `你是爸爸。现在是${input.handoffDateLabel}，请根据${input.dateLabel}我和盼盼的完整聊天，给今天的自己留一份交接。只依据原始聊天，不猜测、不补写，只输出合法 JSON。`
+      },
+      { role: "user", content: input.prompt }
     ],
     temperature: 0,
     max_tokens: readDreamMaxTokens(env),
+    reasoning_effort: readDreamReasoningEffort(env),
     response_format: {
       type: "json_object"
     },
@@ -587,18 +548,21 @@ async function callDigestModel(
 
   try {
     const response = await callOpenAICompat(env, request);
-    if (!response.ok) return { digest: null, reason: "model_error", model, status: response.status };
+    if (!response.ok) return { handoff: null, reason: "model_error", model, status: response.status };
     const parsed = (await response.json()) as OpenAIChatResponse;
     const choice = parsed.choices?.[0];
     const message = choice?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
     const content = typeof message?.content === "string" ? message.content.trim() : "";
     const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
     const json = extractJsonObject(content || reasoning);
-    if (!json) return { digest: null, reason: "model_invalid_json", model, finishReason: choice?.finish_reason };
-    return { digest: normalizeDigestResult(json), model };
+    const handoff = normalizeDailyHandoffResult(json);
+    if (!handoff) {
+      return { handoff: null, reason: "model_invalid_json", model, finishReason: choice?.finish_reason };
+    }
+    return { handoff, model };
   } catch (error) {
-    console.error("dream model failed", error);
-    return { digest: null, reason: "model_error", model };
+    console.error("daily handoff model failed", error);
+    return { handoff: null, reason: "model_error", model };
   }
 }
 
@@ -643,230 +607,175 @@ function shouldSaveDailySummaryMemory(env: Env): boolean {
   return env.ENABLE_DAILY_SUMMARY_MEMORY === "true";
 }
 
-async function saveImportantExcerpts(
-  env: Env,
-  input: { namespace: string; dateLabel: string; excerpts: ImportantExcerpt[]; fallbackMessageIds: string[] }
-): Promise<number> {
-  let saved = 0;
-  const limit = readDreamExcerptLimit(env);
-
-  for (const excerpt of input.excerpts.slice(0, limit)) {
-    const quote = readString(excerpt.quote);
-    if (!quote) continue;
-    const reason = readString(excerpt.reason);
-    const content = [`【${input.dateLabel} 重要原文】`, quote, reason ? `保存原因：${reason}` : ""]
-      .filter(Boolean)
-      .join("\n");
-
-    await createVectorMemory(env, {
-      namespace: input.namespace,
-      type: "excerpt",
-      content,
-      importance: 0.72,
-      confidence: 0.9,
-      tags: uniqueStrings(["important-excerpt", input.dateLabel, ...(excerpt.tags ?? [])]),
-      source: "dream",
-      sourceMessageIds: excerpt.source_message_ids?.length ? excerpt.source_message_ids : input.fallbackMessageIds
-    });
-    saved += 1;
-  }
-
-  return saved;
-}
-
-async function applyMemoryUpdates(
-  env: Env,
-  input: { namespace: string; updates: DigestMemoryUpdate[]; deletes: DigestMemoryDelete[] }
-): Promise<{ updated: number; deleted: number }> {
-  let updated = 0;
-  let deleted = 0;
-
-  for (const item of input.updates) {
-    const existing = await getVectorMemory(env, item.target_id);
-    if (!existing || existing.namespace !== input.namespace || existing.status !== "active") continue;
-
-    const next = await updateVectorMemory(env, item.target_id, {
-      type: item.type,
-      content: item.content,
-      importance: item.importance,
-      confidence: item.confidence,
-      tags: item.tags
-    });
-
-    if (next) updated += 1;
-  }
-
-  for (const item of input.deletes) {
-    const existing = await getVectorMemory(env, item.target_id);
-    if (!existing || existing.status !== "active" || existing.pinned) continue;
-    await deleteVectorMemory(env, item.target_id);
-    deleted += 1;
-  }
-
-  return { updated, deleted };
-}
-
 export async function runDailyMemoryDigest(
   env: Env,
   namespace: string,
-  options: { dateLabel?: string; force?: boolean } = {}
+  options: { dateLabel?: string; force?: boolean; executionTime?: string } = {}
 ): Promise<DailyDigestRunResult> {
   if (!isDreamEnabled(env)) return { ran: false, mode: "dream", reason: "dream_disabled" };
 
   const timeZone = readDreamTimeZone(env);
-  const dateLabel = readString(options.dateLabel) || getTargetDigestDateLabel(timeZone);
-  const { startIso, endIso } = getDateRangeForLabel(dateLabel, timeZone);
-  const cursorName = `dream:${namespace}:${dateLabel}`;
-  const legacyCursorName = `daily_digest:${namespace}:${dateLabel}`;
-  const cursor = (await readCursor(env.DB, cursorName)) ?? (await readCursor(env.DB, legacyCursorName));
-  const cursorState = options.force ? { done: false, after: null } : readDailyCursor(cursor, startIso, endIso);
-  if (cursorState.done) {
-    return { ran: false, mode: "dream", date: dateLabel, reason: "already_done", startIso, endIso, cursor };
-  }
-
-  const maxMessages = readDreamMaxMessages(env);
-  const messages = await listMessagesByNamespaceInRange(env.DB, {
+  const executionTime = readString(options.executionTime);
+  const executionDate = executionTime ? new Date(executionTime) : new Date();
+  const dateLabel = readString(options.dateLabel) || getTargetDigestDateLabel(timeZone, executionDate);
+  const { startIso, endIso } = await resolveDateRange(env.DB, {
     namespace,
-    startCreatedAt: startIso,
-    endCreatedAt: endIso,
-    afterCreatedAt: cursorState.after,
-    limit: maxMessages
+    dateLabel,
+    timeZone,
+    executionTime: executionTime ?? undefined
   });
-  if (messages.length === 0) {
-    await writeCursor(env.DB, cursorName, `done:${cursorState.after ?? startIso}`);
-    return { ran: false, mode: "dream", date: dateLabel, reason: "no_messages", startIso, endIso, cursor };
-  }
-
-  const lastMessage = messages[messages.length - 1];
-  const hasMore = messages.length >= maxMessages;
-  const memoryContextLimit = readDreamMemoryContextLimit(env);
-  let existingMemories: MemoryApiRecord[] = [];
-  try {
-    existingMemories = (await listVectorMemories(env, {
-      namespace,
-      count: memoryContextLimit
-    })).data;
-  } catch (error) {
-    console.error("dream: failed to list existing vector memories", error);
-  }
+  const handoffCursorName = `dream_handoff:${namespace}:${dateLabel}`;
+  const previousCursor = (await readCursor(env.DB, handoffCursorName))
+    ?? (await readCursor(env.DB, `dream:${namespace}:${dateLabel}`))
+    ?? (await readCursor(env.DB, `daily_digest:${namespace}:${dateLabel}`));
+  const handoffDone = !options.force && Boolean(previousCursor?.startsWith("done:"));
   const cleanedEmptyMemories = await cleanEmptyMemories(env, namespace);
 
-  const prompt = buildDigestPrompt({
-    dateLabel,
-    startIso,
-    endIso,
-    messages,
-    existingMemories,
-    excerptLimit: readDreamExcerptLimit(env),
-    hasMore
-  });
-  const modelResult = await callDigestModel(env, prompt);
-  const digest = modelResult.digest;
-  if (!digest) {
-    console.error("dream: model did not return valid JSON; cursor not advanced", {
-      reason: modelResult.reason,
-      model: modelResult.model,
-      status: modelResult.status
-    });
-    return {
-      ran: false,
-      mode: "dream",
-      date: dateLabel,
-      reason: modelResult.reason ?? "model_error",
-      startIso,
-      endIso,
-      cursor,
-      processedMessages: messages.length,
-      model: modelResult.model,
-      status: modelResult.status,
-      finishReason: modelResult.finishReason
-    };
-  }
-  const messageIds = messages.map((message) => message.id);
-  const messagesStillPresent = await getMessagesByIds(env.DB, { namespace, ids: messageIds });
-  if (messagesStillPresent.length !== messageIds.length) {
-    // 手动删除可能和正在运行的 dream 重叠；缺一条就整批放弃，不把已删内容写回记忆。
-    return {
-      ran: false,
-      mode: "dream",
-      date: dateLabel,
-      reason: "messages_deleted_during_run",
-      startIso,
-      endIso,
-      cursor,
-      processedMessages: messages.length,
-    };
-  }
-
-  const rawSummaryContent = formatDailySummary(digest, dateLabel, messages);
-  const summaryContent = await repairDailySummaryPerspective(env, rawSummaryContent);
-  if ((await getMessagesByIds(env.DB, { namespace, ids: messageIds })).length !== messageIds.length) {
-    return { ran: false, mode: "dream", reason: "messages_deleted_during_run", date: dateLabel, startIso, endIso, cursor };
-  }
-
-  if (summaryContent) {
-    await upsertSummary(env.DB, {
+  let handoffProcessedMessages = 0;
+  let handoffSaved = false;
+  if (!handoffDone) {
+    let handoffMessages = await listAllGardenHandoffMessages(env.DB, {
       namespace,
-      content: summaryContent,
-      fromMessageId: messages[0]?.id ?? null,
-      toMessageId: lastMessage.id,
-      messageCount: messages.length
+      startCreatedAt: startIso,
+      endCreatedAt: endIso
     });
-    if (shouldSaveDailySummaryMemory(env)) {
-      await saveDailySummaryMemory(env, {
+    let usingGardenSources = handoffMessages.length > 0;
+    if (!usingGardenSources) {
+      handoffMessages = await listAllHandoffMessages(env.DB, {
         namespace,
-        dateLabel,
-        content: summaryContent,
-        messageIds
+        startCreatedAt: startIso,
+        endCreatedAt: endIso
       });
     }
-  } else {
-    console.error("dream: summary perspective repair failed; keeping previous long-term summary");
+    handoffProcessedMessages = handoffMessages.length;
+
+    if (handoffMessages.length > 0) {
+      const handoffDateLabel = addDaysToDateLabel(dateLabel, 1, timeZone);
+      const handoffModelResult = await callDailyHandoffModel(env, {
+        prompt: buildDailyHandoffPrompt({
+          dateLabel,
+          handoffDateLabel,
+          messages: handoffMessages
+        }),
+        dateLabel,
+        handoffDateLabel
+      });
+      if (!handoffModelResult.handoff) {
+        return {
+          ran: false,
+          mode: "dream",
+          date: dateLabel,
+          reason: handoffModelResult.reason ?? "model_error",
+          startIso,
+          endIso,
+          cursor: previousCursor,
+          processedMessages: handoffMessages.length,
+          model: handoffModelResult.model,
+          status: handoffModelResult.status,
+          finishReason: handoffModelResult.finishReason
+        };
+      }
+
+      const handoffIds = handoffMessages.map((message) => message.id);
+      const sourcesStillPresent = usingGardenSources
+        ? await areGardenSourceMessagesActive(env.DB, namespace, handoffIds)
+        : await areMessagesStillPresent(env.DB, { namespace, ids: handoffIds });
+      if (!sourcesStillPresent) {
+        return {
+          ran: false,
+          mode: "dream",
+          date: dateLabel,
+          reason: "messages_deleted_during_run",
+          startIso,
+          endIso,
+          cursor: previousCursor,
+          processedMessages: handoffMessages.length
+        };
+      }
+
+      const summaryContent = await repairDailySummaryPerspective(
+        env,
+        formatDailyHandoff(handoffModelResult.handoff, dateLabel)
+      );
+      if (!summaryContent) {
+        return {
+          ran: false,
+          mode: "dream",
+          date: dateLabel,
+          reason: "model_error",
+          startIso,
+          endIso,
+          cursor: previousCursor,
+          processedMessages: handoffMessages.length,
+          model: readDreamModel(env) ?? undefined
+        };
+      }
+
+      await upsertSummary(env.DB, {
+        namespace,
+        content: summaryContent,
+        fromMessageId: handoffMessages[0]?.id ?? null,
+        toMessageId: handoffMessages[handoffMessages.length - 1]?.id ?? null,
+        messageCount: handoffMessages.length
+      });
+      if (shouldSaveDailySummaryMemory(env)) {
+        await saveDailySummaryMemory(env, {
+          namespace,
+          dateLabel,
+          content: summaryContent,
+          messageIds: handoffIds
+        });
+      }
+      handoffSaved = true;
+    }
+    await writeCursor(env.DB, handoffCursorName, `done:${endIso}`);
   }
 
-  const updates = await applyMemoryUpdates(env, {
-    namespace,
-    updates: digest.memories_to_update ?? [],
-    deletes: digest.memories_to_delete ?? []
-  });
-
-  let addedMemories = 0;
-  for (const memory of digest.memories_to_add ?? []) {
-    const saved = await createVectorMemory(env, {
-      namespace,
-      type: memory.type,
-      content: memory.content,
-      importance: memory.importance,
-      confidence: memory.confidence,
-      tags: memory.tags,
-      source: "dream",
-      sourceMessageIds: memory.source_message_ids.length ? memory.source_message_ids : messageIds
-    });
-    if (saved) addedMemories += 1;
+  const longTerm = await runLongTermMemoryDigestBatch(env, namespace, { timeZone });
+  if (!longTerm.ran && longTerm.reason !== "no_messages") {
+    return {
+      ran: false,
+      mode: "dream",
+      date: dateLabel,
+      reason: longTerm.reason === "messages_changed_during_run"
+        ? "messages_deleted_during_run"
+        : longTerm.reason,
+      startIso,
+      endIso,
+      cursor: previousCursor,
+      processedMessages: longTerm.processedMessages,
+      model: longTerm.model,
+      status: longTerm.status,
+      finishReason: longTerm.finishReason
+    };
   }
 
-  const savedExcerpts = await saveImportantExcerpts(env, {
-    namespace,
-    dateLabel,
-    excerpts: digest.important_excerpts ?? [],
-    fallbackMessageIds: messageIds
-  });
-
-  await writeCursor(env.DB, cursorName, hasMore ? lastMessage.created_at : `done:${lastMessage.created_at}`);
+  if (!longTerm.ran && !handoffSaved) {
+    return {
+      ran: false,
+      mode: "dream",
+      date: dateLabel,
+      reason: handoffDone ? "already_done" : "no_messages",
+      startIso,
+      endIso,
+      cursor: previousCursor,
+      processedMessages: handoffProcessedMessages
+    };
+  }
 
   return {
     ran: true,
     stats: {
       date: dateLabel,
       mode: "dream",
-      processedMessages: messages.length,
-      addedMemories,
-      updatedMemories: updates.updated,
-      deletedMemories: updates.deleted,
-      savedExcerpts,
+      processedMessages: longTerm.ran ? longTerm.stats.processedMessages : handoffProcessedMessages,
+      addedMemories: longTerm.ran ? longTerm.stats.addedMemories : 0,
+      updatedMemories: longTerm.ran ? longTerm.stats.updatedMemories : 0,
+      deletedMemories: 0,
+      savedExcerpts: 0,
       cleanedEmptyMemories,
       cursorAdvanced: true,
-      hasMore
+      hasMore: longTerm.ran ? longTerm.stats.hasMore : false
     }
   };
 }

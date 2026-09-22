@@ -104,6 +104,58 @@ test('batched selection preserves replay, missing-candidate and concurrent-revis
   } finally { sqlite.close(); }
 });
 
+test('selection restores an interrupted assistant candidate when the stream ended before persistence', async () => {
+  const { sqlite, DB, select } = fixture();
+  try {
+    await saveUserMessages(DB, {
+      conversationId: 'default:chat', namespace: 'default', source: 'test',
+      requestModel: 'request-model', upstreamModel: 'upstream-model', upstreamProvider: 'test',
+      stream: true, replyVariant: { turnId: 'turn-interrupted', variantId: 'v-partial' },
+      messages: [{ role: 'user', content: 'question' }],
+    });
+    const selection = {
+      action: 'select', turnId: 'turn-interrupted', variantId: 'v-partial', revision: 1,
+      assistantContent: 'partial answer', assistantReasoning: 'paid reasoning', deliveryStatus: 'interrupted',
+    };
+    assert.equal((await select(selection)).status, 200);
+    assert.equal((await select(selection)).status, 200);
+    const assistant = sqlite.prepare(`SELECT content, reasoning_content, finish_reason, memory_active
+      FROM messages WHERE client_variant_id = 'v-partial' AND role = 'assistant'`).get();
+    assert.deepEqual(assistant, {
+      content: 'partial answer', reasoning_content: 'paid reasoning',
+      finish_reason: 'interrupted', memory_active: 1,
+    });
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM messages
+      WHERE client_variant_id = 'v-partial' AND role = 'assistant'`).get().n, 1);
+    assert.equal((await select({ ...selection, turnId: 'missing-turn', variantId: 'missing', revision: 2 })).status, 409);
+  } finally { sqlite.close(); }
+});
+
+test('edited prompt removes remote variants without retaining an archive row', async () => {
+  const { sqlite, pair, select } = fixture();
+  try {
+    await pair('turn-edit', 'v1', 'first answer');
+    await pair('turn-edit', 'v2', 'second answer');
+    assert.equal((await select({ action: 'select', turnId: 'turn-edit', variantId: 'v1', revision: 1 })).status, 200);
+    assert.equal((await select({ action: 'select', turnId: 'turn-edit', variantId: 'v2', revision: 2 })).status, 200);
+
+    const archive = {
+      action: 'archive_edit', archiveId: 'archive-one', turnId: 'turn-edit', variantId: 'v2', revision: 2,
+      draftContent: 'edited question', discardedTurns: [],
+    };
+    assert.equal((await select(archive)).status, 200);
+    assert.equal(sqlite.prepare("SELECT count(*) n FROM messages WHERE client_turn_id = 'turn-edit'").get().n, 0);
+    assert.equal(sqlite.prepare("SELECT count(*) n FROM reply_selections WHERE turn_id = 'turn-edit'").get().n, 0);
+    assert.equal(sqlite.prepare("SELECT count(*) n FROM reply_edit_archives").get().n, 0);
+
+    assert.equal((await select({ ...archive, draftContent: 'edited question twice' })).status, 200);
+    assert.equal((await select({ action: 'update_edit_draft', archiveId: 'archive-one', draftContent: 'final wording' })).status, 200);
+    assert.equal((await select({ action: 'delete_edit_archive', archiveId: 'archive-one' })).status, 200);
+    assert.equal((await select({ action: 'delete_edit_archive', archiveId: 'archive-one' })).status, 200);
+    assert.equal(sqlite.prepare("SELECT count(*) n FROM reply_edit_archives").get().n, 0);
+  } finally { sqlite.close(); }
+});
+
 test('legacy adoption requires a unique exact pair; ambiguous history is untouched', async () => {
   const { sqlite, pair, select } = fixture();
   try {
@@ -143,7 +195,27 @@ for (const provider of ['openai', 'anthropic']) test(`${provider} managed stream
   } finally { sqlite.close(); }
 });
 
-for (const provider of ['openai', 'anthropic']) test(`${provider} interrupted stream cannot become a candidate`, async () => {
+test('openai managed stream persists visible answer routed through reasoning_content on truncation', async () => {
+  const { sqlite, env } = fixture();
+  try {
+    const event = value => `data: ${JSON.stringify(value)}\n\n`;
+    const data = event({ choices: [{ delta: { reasoning_content: '<thinking>内部推理</thin' }, finish_reason: null }] })
+      + event({ choices: [{ delta: { reasoning_content: 'king>截断前仍然产生的正文' }, finish_reason: null }] })
+      + event({ choices: [{ delta: { content: ' ' }, finish_reason: 'length' }] })
+      + 'data: [DONE]\n\n';
+    const response = streamOpenAIWithTee(new Response(data), {
+      env, ctx: { waitUntil() {} }, profile: KEY_PROFILES.chatbox,
+      conversationId: 'default:chat', requestModel: 'test', upstreamModel: 'test', provider: 'openai',
+      replyVariant: { turnId: 'turn', variantId: 'truncated' },
+    });
+    assert.ok((await response.text()).includes('[DONE]'));
+    const row = sqlite.prepare("SELECT content, finish_reason FROM messages WHERE client_variant_id = 'truncated'").get();
+    assert.equal(row.content, '截断前仍然产生的正文 ');
+    assert.equal(row.finish_reason, 'length');
+  } finally { sqlite.close(); }
+});
+
+for (const provider of ['openai', 'anthropic']) test(`${provider} interrupted stream with visible text becomes an inactive candidate`, async () => {
   const { sqlite, env } = fixture();
   try {
     const event = provider === 'openai'
@@ -156,7 +228,45 @@ for (const provider of ['openai', 'anthropic']) test(`${provider} interrupted st
       replyVariant: { turnId: 'turn', variantId: 'interrupted' },
     });
     await assert.rejects(response.text(), /finish reason/);
-    assert.equal(sqlite.prepare("SELECT count(*) n FROM messages WHERE client_variant_id = 'interrupted'").get().n, 0);
+    const row = sqlite.prepare("SELECT content, finish_reason, memory_active FROM messages WHERE client_variant_id = 'interrupted'").get();
+    assert.equal(row.content, 'partial');
+    assert.equal(row.finish_reason, 'interrupted');
+    assert.equal(row.memory_active, 0);
+  } finally { sqlite.close(); }
+});
+
+for (const provider of ['openai', 'anthropic']) test(`${provider} interrupted stream without visible text is not persisted`, async () => {
+  const { sqlite, env } = fixture();
+  try {
+    const stream = provider === 'openai' ? streamOpenAIWithTee : streamAnthropicToOpenAI;
+    const response = stream(new Response(''), {
+      env, ctx: { waitUntil() {} }, profile: KEY_PROFILES.chatbox,
+      conversationId: 'default:chat', requestModel: 'test', upstreamModel: 'test', provider,
+      replyVariant: { turnId: 'turn', variantId: 'empty-interrupted' },
+    });
+    await assert.rejects(response.text(), /finish reason/);
+    assert.equal(sqlite.prepare("SELECT count(*) n FROM messages WHERE client_variant_id = 'empty-interrupted'").get().n, 0);
+  } finally { sqlite.close(); }
+});
+
+for (const provider of ['openai', 'anthropic']) test(`${provider} interrupted stream with only reasoning becomes an inactive candidate`, async () => {
+  const { sqlite, env } = fixture();
+  try {
+    const event = provider === 'openai'
+      ? { choices: [{ delta: { reasoning_content: '花掉的思考' }, finish_reason: null }] }
+      : { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '花掉的思考' } };
+    const stream = provider === 'openai' ? streamOpenAIWithTee : streamAnthropicToOpenAI;
+    const response = stream(new Response(`data: ${JSON.stringify(event)}\n\n`), {
+      env, ctx: { waitUntil() {} }, profile: KEY_PROFILES.chatbox,
+      conversationId: 'default:chat', requestModel: 'test', upstreamModel: 'test', provider,
+      replyVariant: { turnId: 'turn', variantId: 'reasoning-only' },
+    });
+    await assert.rejects(response.text(), /finish reason/);
+    const row = sqlite.prepare("SELECT content, reasoning_content, finish_reason, memory_active FROM messages WHERE client_variant_id = 'reasoning-only'").get();
+    assert.equal(row.content, '');
+    assert.equal(row.reasoning_content, '花掉的思考');
+    assert.equal(row.finish_reason, 'interrupted');
+    assert.equal(row.memory_active, 0);
   } finally { sqlite.close(); }
 });
 

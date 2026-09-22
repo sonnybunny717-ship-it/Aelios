@@ -168,13 +168,12 @@ async function getVectorsByIdsBatched(
   vectorize: Vectorize | VectorizeIndex,
   ids: string[]
 ): Promise<VectorizeVector[]> {
-  const vectors: VectorizeVector[] = [];
-
+  const batchPromises: Promise<VectorizeVector[]>[] = [];
   for (let index = 0; index < ids.length; index += 20) {
-    vectors.push(...(await vectorize.getByIds(ids.slice(index, index + 20))));
+    batchPromises.push(vectorize.getByIds(ids.slice(index, index + 20)));
   }
-
-  return vectors;
+  const batches = await Promise.all(batchPromises);
+  return batches.flat();
 }
 
 function candidateVectorIds(id: string): string[] {

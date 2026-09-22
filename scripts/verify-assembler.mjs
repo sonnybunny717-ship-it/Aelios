@@ -694,20 +694,52 @@ function assembledToAnthropicMessages(messages) {
   const result = [];
   for (const msg of messages) {
     const role = msg.role;
-    const text = typeof msg.content === "string" ? msg.content
-      : msg.content == null ? ""
-      : JSON.stringify(msg.content);
+    const blocks = openAIContentToAnthropicBlocks(msg.content);
     const prev = result[result.length - 1];
     if (prev?.role === role) {
-      prev.content.push({ type: "text", text });
+      prev.content.push(...blocks);
       continue;
     }
-    result.push({ role, content: [{ type: "text", text }] });
+    result.push({ role, content: blocks });
   }
   if (result.length === 0) {
     result.push({ role: "user", content: [{ type: "text", text: "" }] });
   }
   return result;
+}
+
+function openAIContentToAnthropicBlocks(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (content == null) return [{ type: "text", text: "" }];
+  const blocks = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object" || Array.isArray(part)) {
+      blocks.push({ type: "text", text: JSON.stringify(part) });
+      continue;
+    }
+    if (part.type === "text" && typeof part.text === "string") {
+      blocks.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image_url" || part.type === "input_image") {
+      const rawImage = part.image_url;
+      const url = typeof rawImage === "string" ? rawImage : rawImage?.url || part.url || "";
+      const dataMatch = url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,([\s\S]+)$/i);
+      if (dataMatch) {
+        blocks.push({
+          type: "image",
+          source: { type: "base64", media_type: dataMatch[1].toLowerCase(), data: dataMatch[2] },
+        });
+        continue;
+      }
+      if (/^https?:\/\//i.test(url)) {
+        blocks.push({ type: "image", source: { type: "url", url } });
+        continue;
+      }
+    }
+    blocks.push({ type: "text", text: JSON.stringify(part) });
+  }
+  return blocks.length ? blocks : [{ type: "text", text: "" }];
 }
 
 function assembledToOpenAISystem(systemBlocks) {
@@ -777,7 +809,7 @@ check("anthropic messages convert user/assistant correctly", () => {
   assert.strictEqual(last.content[0].text, "今天天气怎么样？");
 });
 
-check("anthropic stringifies structured content for image", () => {
+check("anthropic converts image_url to a native URL image block", () => {
   const ctx = makeBaseCtx();
   ctx.currentUserMessage = {
     role: "user",
@@ -791,12 +823,14 @@ check("anthropic stringifies structured content for image", () => {
   const last = anthropicMsgs[anthropicMsgs.length - 1];
 
   assert.strictEqual(last.role, "user");
-  assert.strictEqual(last.content.length, 1);
+  assert.strictEqual(last.content.length, 2);
   assert.strictEqual(last.content[0].type, "text");
-  // Should be JSON-stringified since it's structured content
-  const parsed = JSON.parse(last.content[0].text);
-  assert.strictEqual(parsed.length, 2);
-  assert.strictEqual(parsed[1].type, "image_url");
+  assert.strictEqual(last.content[0].text, "看图");
+  assert.strictEqual(last.content[1].type, "image");
+  assert.deepStrictEqual(last.content[1].source, {
+    type: "url",
+    url: "https://example.com/img.jpg",
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +1128,7 @@ check("tool/tool_calls request → hasToolContent=true (fallback for both paths)
   assert.strictEqual(hasToolContent(body), true);
 });
 
-check("structured content (image_url) goes through JSON.stringify fallback in Anthropic", () => {
+check("structured image_url becomes a native Anthropic image block", () => {
   const ctx = makeBaseCtx();
   ctx.currentUserMessage = {
     role: "user",
@@ -1108,15 +1142,14 @@ check("structured content (image_url) goes through JSON.stringify fallback in An
   const last = anthropicMsgs[anthropicMsgs.length - 1];
 
   assert.strictEqual(last.role, "user");
-  assert.strictEqual(last.content.length, 1);
+  assert.strictEqual(last.content.length, 2);
   assert.strictEqual(last.content[0].type, "text");
-  // JSON.stringify fallback — structured content is stringified, not lost
-  const parsed = JSON.parse(last.content[0].text);
-  assert.ok(Array.isArray(parsed));
-  assert.strictEqual(parsed.length, 2);
-  assert.strictEqual(parsed[0].type, "text");
-  assert.strictEqual(parsed[1].type, "image_url");
-  assert.strictEqual(parsed[1].image_url.url, "https://example.com/cat.jpg");
+  assert.strictEqual(last.content[0].text, "描述这张图");
+  assert.strictEqual(last.content[1].type, "image");
+  assert.deepStrictEqual(last.content[1].source, {
+    type: "url",
+    url: "https://example.com/cat.jpg",
+  });
 });
 
 check("applyCacheOverrides removes cache_control when ANTHROPIC_CACHE_ENABLED=false", () => {
@@ -1422,6 +1455,7 @@ function buildOpenAIRequestFromAssembled(req, targetModel, assembled, env) {
   delete cleaned.post_user_instructions;
   delete cleaned.context_epoch;
   delete cleaned.context_compaction;
+  delete cleaned.vision_mode;
   if (isOpenRouterAnthropicModel(targetModel) && env) {
     if (typeof cleaned.conversation_id === "string" && typeof cleaned.session_id !== "string") {
       cleaned.session_id = cleaned.conversation_id;
@@ -1763,6 +1797,16 @@ check("OpenAI helper: strips context compaction control fields before upstream",
   assert.strictEqual("context_compaction" in req, false);
 });
 
+check("OpenAI helper: strips the Aelios vision routing field before upstream", () => {
+  const assembled = assemble(makeBaseCtx());
+  const req = buildOpenAIRequestFromAssembled(
+    { model: "companion", messages: [], vision_mode: "current" },
+    "deepseek/deepseek-v4-pro",
+    assembled
+  );
+  assert.strictEqual("vision_mode" in req, false);
+});
+
 check("OpenRouter Claude helper: keeps layered anchors and rolling user cache", () => {
   const ctx = makeBaseCtx();
   ctx.systemMessages = [{ role: "system", content: "测试角色\n当前时间: 2026-07-19 12:34 周日" }];
@@ -2043,7 +2087,7 @@ check("Anthropic helper: automatic cache is opt-in", () => {
   assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
 });
 
-check("Anthropic helper: structured content stringified (temporary fallback)", () => {
+check("Anthropic helper: structured image content stays multimodal", () => {
   const ctx = makeBaseCtx();
   ctx.currentUserMessage = {
     role: "user",
@@ -2061,12 +2105,13 @@ check("Anthropic helper: structured content stringified (temporary fallback)", (
   );
   const last = req.messages[req.messages.length - 1];
   assert.strictEqual(last.role, "user");
-  assert.strictEqual(last.content.length, 2);
+  assert.strictEqual(last.content.length, 3);
   assert.strictEqual(last.content[0].type, "text");
-  const parsed = JSON.parse(last.content[0].text);
-  assert.strictEqual(parsed[1].type, "image_url");
-  assert.ok(last.content[1].text.includes("<memories>"));
-  assert.strictEqual(last.content[1].cache_control, undefined);
+  assert.strictEqual(last.content[0].text, "看图");
+  assert.strictEqual(last.content[1].type, "image");
+  assert.strictEqual(last.content[1].source.url, "https://example.com/cat.jpg");
+  assert.ok(last.content[2].text.includes("<memories>"));
+  assert.strictEqual(last.content[2].cache_control, undefined);
 });
 
 check("Anthropic helper: model prefix stripped", () => {

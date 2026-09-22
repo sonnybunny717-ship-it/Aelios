@@ -115,4 +115,4 @@ export const PERSONA_MEMORY_TYPES: readonly string[] = ["identity", "persona"] a
 // Summary truncation limit (character proxy for tokens)
 // ---------------------------------------------------------------------------
 
-export const SUMMARY_MAX_CHARS = 2000;
+export const SUMMARY_MAX_CHARS = 2200;

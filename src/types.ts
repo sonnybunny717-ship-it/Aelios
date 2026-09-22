@@ -28,6 +28,7 @@ export interface Env {
   DREAM_MAX_RUNS?: string;
   DREAM_MAX_TOKENS?: string;
   DREAM_MODEL?: string;
+  DREAM_REASONING_EFFORT?: string;
   WINDOW_SUMMARY_MODEL?: string;
   DREAM_MEMORY_CONTEXT_LIMIT?: string;
   DREAM_EXCERPT_LIMIT?: string;
