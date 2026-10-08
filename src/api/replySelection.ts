@@ -153,7 +153,66 @@ export async function handleReplySelection(request: Request, env: Env): Promise<
   const rawId = new URL(request.url).pathname.slice("/v1/conversations/".length, -"/reply-selection".length);
   const conversationId = normalizeConversationId(rawId, namespace);
   if (!conversationId) return openAiError("Invalid conversation id", 400);
-  if (request.method === "GET") return json({ version: 2, editArchives: true });
+  if (request.method === "GET") {
+    const url = new URL(request.url);
+    const turnId = url.searchParams.get("turnId");
+    const variantId = url.searchParams.get("variantId");
+    if (turnId == null && variantId == null) return json({ version: 2, editArchives: true, completedCandidate: true });
+    let variant;
+    try { variant = parseReplyVariant({ turnId, variantId }); }
+    catch { return openAiError("Invalid reply variant", 400); }
+    if (!variant) return openAiError("Invalid reply variant", 400);
+    const candidate = await env.DB.prepare(`SELECT
+      id, content, reasoning_content, finish_reason, upstream_model, upstream_provider,
+      request_model, token_input, token_output, cache_read_tokens,
+      cache_creation_tokens, raw_usage_json, created_at
+      FROM messages WHERE namespace = ? AND conversation_id = ?
+      AND client_turn_id = ? AND client_variant_id = ? AND role = 'assistant'
+      ORDER BY created_at DESC LIMIT 1`)
+      .bind(namespace, conversationId, variant.turnId, variant.variantId)
+      .first<{
+        id: string;
+        content: string;
+        reasoning_content: string | null;
+        finish_reason: string | null;
+        upstream_model: string | null;
+        upstream_provider: string | null;
+        request_model: string | null;
+        token_input: number | null;
+        token_output: number | null;
+        cache_read_tokens: number | null;
+        cache_creation_tokens: number | null;
+        raw_usage_json: string | null;
+        created_at: string;
+      }>();
+    if (!candidate) return json({ version: 2, editArchives: true, completedCandidate: true, candidate: null });
+    let rawUsage: Record<string, unknown> = {};
+    try { rawUsage = JSON.parse(candidate.raw_usage_json || "{}") as Record<string, unknown>; }
+    catch {}
+    return json({
+      version: 2,
+      editArchives: true,
+      completedCandidate: true,
+      candidate: {
+        messageId: candidate.id,
+        turnId: variant.turnId,
+        variantId: variant.variantId,
+        content: candidate.content,
+        reasoningContent: candidate.reasoning_content || "",
+        finishReason: candidate.finish_reason,
+        model: candidate.request_model || candidate.upstream_model || "",
+        provider: candidate.upstream_provider || "",
+        createdAt: candidate.created_at,
+        usage: {
+          ...rawUsage,
+          prompt_tokens: candidate.token_input ?? rawUsage.prompt_tokens ?? rawUsage.input_tokens ?? 0,
+          completion_tokens: candidate.token_output ?? rawUsage.completion_tokens ?? rawUsage.output_tokens ?? 0,
+          cache_read_input_tokens: candidate.cache_read_tokens ?? rawUsage.cache_read_input_tokens ?? 0,
+          cache_creation_input_tokens: candidate.cache_creation_tokens ?? rawUsage.cache_creation_input_tokens ?? 0,
+        },
+      },
+    });
+  }
   let body: Record<string, unknown>;
   try { body = await request.json() as Record<string, unknown>; }
   catch { return openAiError("Invalid JSON", 400); }

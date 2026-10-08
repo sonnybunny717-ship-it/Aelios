@@ -6,7 +6,7 @@ import {
 import { listMemories } from "../db/memories";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { parseReplyVariant } from "../db/replyVariants";
-import { getLatestSummary } from "../db/summaries";
+import { getLatestDailySummaryBundle, getLatestLongTermSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
 import { extractLastUserText, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
 import { toMemoryApiRecord } from "../memory/search";
@@ -215,7 +215,8 @@ export async function handleChatCompletions(
   });
 
   const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env.DB, auth.profile.namespace);
-  const latestSummary = await getLatestSummary(env.DB, auth.profile.namespace);
+  const latestSummary = (await getLatestDailySummaryBundle(env.DB, auth.profile.namespace, 2))
+    ?? (await getLatestLongTermSummary(env.DB, auth.profile.namespace));
   let conversationContext: PreparedConversationContext;
   try {
     conversationContext = await prepareConversationContext(env, {

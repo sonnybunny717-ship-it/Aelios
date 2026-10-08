@@ -1,6 +1,6 @@
 import { getMessagesByIds } from "../db/messages";
 import { readCursor, writeCursor } from "../db/retention";
-import { upsertSummary } from "../db/summaries";
+import { upsertDailySummary } from "../db/summaries";
 import {
   areGardenSourceMessagesActive,
   listGardenSourceMessagesInRange
@@ -711,8 +711,9 @@ export async function runDailyMemoryDigest(
         };
       }
 
-      await upsertSummary(env.DB, {
+      await upsertDailySummary(env.DB, {
         namespace,
+        dateLabel,
         content: summaryContent,
         fromMessageId: handoffMessages[0]?.id ?? null,
         toMessageId: handoffMessages[handoffMessages.length - 1]?.id ?? null,

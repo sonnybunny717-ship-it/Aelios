@@ -16,7 +16,7 @@ import type {
 const MAX_COMPACTION_MESSAGES = 60;
 const MAX_COMPACTION_INPUT_CHARS = 80_000;
 const WINDOW_SUMMARY_MAX_CHARS = 1_200;
-const LONG_TERM_STATE_MAX_CHARS = 900;
+const LONG_TERM_STATE_MAX_CHARS = 2_000;
 
 interface ContextCompactionMessage {
   role: "user" | "assistant";

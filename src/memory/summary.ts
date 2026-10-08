@@ -2,10 +2,10 @@ import { callOpenAICompat } from "../proxy/openaiAdapter";
 import { getMessagesByIds } from "../db/messages";
 import {
   countMessagesAfter,
-  getLatestSummary,
+  getLatestLongTermSummary,
   getMessageCreatedAt,
   listRecentMessagesForSummary,
-  upsertSummary,
+  upsertLongTermSummary,
 } from "../db/summaries";
 import type { Env, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { SUMMARY_MAX_CHARS } from "../assembler/types";
@@ -195,7 +195,7 @@ export async function maybeUpdateLongTermSummary(
   const model = env.DREAM_MODEL || env.DAILY_DIGEST_MODEL || env.SUMMARY_MODEL;
   if (!model) return { updated: false };
 
-  const latest = await getLatestSummary(env.DB, namespace);
+  const latest = await getLatestLongTermSummary(env.DB, namespace);
 
   // Resolve cursor: prefer to_message_id's created_at (avoids missing messages
   // written concurrently with the summary), fallback to updated_at.
@@ -249,7 +249,7 @@ export async function maybeUpdateLongTermSummary(
   const selected = await getMessagesByIds(env.DB, { namespace, ids: messages.map(message => message.id) });
   if (selected.length !== messages.length) return { updated: false };
 
-  await upsertSummary(env.DB, {
+  await upsertLongTermSummary(env.DB, {
     namespace,
     content: truncated,
     fromMessageId: messages[0]?.id ?? null,
